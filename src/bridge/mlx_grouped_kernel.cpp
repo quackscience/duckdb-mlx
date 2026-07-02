@@ -19,15 +19,15 @@ namespace {
 constexpr int kMaxTileValProgs = 8;
 constexpr int kMaxTileSlots = 512;
 constexpr int kMaxTileCard = 64;
-constexpr int kTileRows = 65536;
+constexpr int kTileRows = 131072;
 constexpr int kThreadsPerGroup = 256;
 
 //! Shared Metal helpers: parallel tree reduce within a threadgroup.
 const char *TileKernelHeader() {
 	return R"(
             template <typename T>
-            void tg_tree_add(threadgroup T *buf, int lid) {
-                for (int off = 128; off > 0; off >>= 1) {
+            void tg_tree_add_n(threadgroup T *buf, int lid, int n) {
+                for (int off = n / 2; off > 0; off >>= 1) {
                     if (lid < off) {
                         buf[lid] += buf[lid + off];
                     }
@@ -40,7 +40,7 @@ const char *TileKernelHeader() {
 const mx::fast::CustomKernelFunction &GroupedTileAccumulateKernel() {
 	static auto kernel = []() {
 		const std::string src = R"(
-            const int tile = 65536;
+            const int tile = 131072;
             const int tgid = int(threadgroup_position_in_grid.x);
             const int start = tgid * tile;
             const int nrows = int(codes_shape[0]);
@@ -101,31 +101,62 @@ const mx::fast::CustomKernelFunction &GroupedTileAccumulateKernel() {
                 }
             }
 
+            const int REDUCE_BATCH = 4;
+            threadgroup long tg_sum[REDUCE_BATCH * 256];
+            threadgroup int tg_cnt[REDUCE_BATCH * 256];
+            threadgroup int tg_rows[REDUCE_BATCH * 256];
+
             threadgroup long block_sum[SLOTS];
             threadgroup int block_cnt[SLOTS];
             threadgroup int block_rows[CARD];
-            threadgroup long tg_sum[256];
-            threadgroup int tg_cnt[256];
-            threadgroup int tg_rows[256];
 
-            for (int s = 0; s < SLOTS; ++s) {
-                tg_sum[lid] = local_sum[s];
-                tg_cnt[lid] = local_cnt[s];
+            for (int base = 0; base < SLOTS; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, SLOTS - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int s = base + i;
+                    tg_sum[i * 256 + lid] = local_sum[s];
+                    tg_cnt[i * 256 + lid] = local_cnt[s];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_sum, lid);
-                tg_tree_add(tg_cnt, lid);
-                if (lid == 0) {
-                    block_sum[s] = tg_sum[0];
-                    block_cnt[s] = tg_cnt[0];
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_sum[i * 256 + lid] += tg_sum[i * 256 + lid + off];
+                            tg_cnt[i * 256 + lid] += tg_cnt[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int s = base + i;
+                        block_sum[s] = tg_sum[i * 256 + 0];
+                        block_cnt[s] = tg_cnt[i * 256 + 0];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            for (int g = 0; g < CARD; ++g) {
-                tg_rows[lid] = local_rows[g];
+
+            for (int base = 0; base < CARD; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, CARD - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int g = base + i;
+                    tg_rows[i * 256 + lid] = local_rows[g];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_rows, lid);
-                if (lid == 0) {
-                    block_rows[g] = tg_rows[0];
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_rows[i * 256 + lid] += tg_rows[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int g = base + i;
+                        block_rows[g] = tg_rows[i * 256 + 0];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
@@ -153,7 +184,7 @@ const mx::fast::CustomKernelFunction &GroupedTileAccumulateKernel() {
 const mx::fast::CustomKernelFunction &GroupedPackedTileKernel() {
 	static auto kernel = []() {
 		const std::string src = R"(
-            const int tile = 65536;
+            const int tile = 131072;
             const int tgid = int(threadgroup_position_in_grid.x);
             const int start = tgid * tile;
             const int nrows = int(codes_shape[0]);
@@ -194,31 +225,62 @@ const mx::fast::CustomKernelFunction &GroupedPackedTileKernel() {
                 }
             }
 
+            const int REDUCE_BATCH = 4;
+            threadgroup long tg_sum[REDUCE_BATCH * 256];
+            threadgroup int tg_cnt[REDUCE_BATCH * 256];
+            threadgroup int tg_rows[REDUCE_BATCH * 256];
+
             threadgroup long block_sum[SLOTS];
             threadgroup int block_cnt[SLOTS];
             threadgroup int block_rows[CARD];
-            threadgroup long tg_sum[256];
-            threadgroup int tg_cnt[256];
-            threadgroup int tg_rows[256];
 
-            for (int s = 0; s < SLOTS; ++s) {
-                tg_sum[lid] = local_sum[s];
-                tg_cnt[lid] = local_cnt[s];
+            for (int base = 0; base < SLOTS; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, SLOTS - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int s = base + i;
+                    tg_sum[i * 256 + lid] = local_sum[s];
+                    tg_cnt[i * 256 + lid] = local_cnt[s];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_sum, lid);
-                tg_tree_add(tg_cnt, lid);
-                if (lid == 0) {
-                    block_sum[s] = tg_sum[0];
-                    block_cnt[s] = tg_cnt[0];
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_sum[i * 256 + lid] += tg_sum[i * 256 + lid + off];
+                            tg_cnt[i * 256 + lid] += tg_cnt[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int s = base + i;
+                        block_sum[s] = tg_sum[i * 256 + 0];
+                        block_cnt[s] = tg_cnt[i * 256 + 0];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            for (int g = 0; g < CARD; ++g) {
-                tg_rows[lid] = local_rows[g];
+
+            for (int base = 0; base < CARD; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, CARD - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int g = base + i;
+                    tg_rows[i * 256 + lid] = local_rows[g];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_rows, lid);
-                if (lid == 0) {
-                    block_rows[g] = tg_rows[0];
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_rows[i * 256 + lid] += tg_rows[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int g = base + i;
+                        block_rows[g] = tg_rows[i * 256 + 0];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
@@ -261,8 +323,8 @@ const mx::fast::CustomKernelFunction &GroupedTileMergeKernel() {
                 tg_sum[lid] = acc_sum;
                 tg_cnt[lid] = acc_cnt;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_sum, lid);
-                tg_tree_add(tg_cnt, lid);
+                tg_tree_add_n(tg_sum, lid, 256);
+                tg_tree_add_n(tg_cnt, lid, 256);
                 if (lid == 0) {
                     final_sums[tg] = tg_sum[0];
                     final_counts[tg] = tg_cnt[0];
@@ -276,7 +338,7 @@ const mx::fast::CustomKernelFunction &GroupedTileMergeKernel() {
                 }
                 tg_rows[lid] = acc_rows;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                tg_tree_add(tg_rows, lid);
+                tg_tree_add_n(tg_rows, lid, 256);
                 if (lid == 0) {
                     final_rows[tg] = tg_rows[0];
                 }
