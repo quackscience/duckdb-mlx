@@ -15,9 +15,17 @@ FROM range(2000000);
 statement ok
 SET mlx_min_rows = 1000;
 
-# Q6 shape intercepts (decimal arithmetic, date + decimal pushed filters)
+# lone decimal sums are scan-bound: the CPU wins via pruned reads => decline
 query II
 EXPLAIN SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# multi-aggregate decimal queries (Q1 class) amortize column reads => intercept
+query II
+EXPLAIN SELECT sum(price * disc), sum(qty), min(price) FROM td
 WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
   AND disc BETWEEN 0.05 AND 0.07 AND qty < 24;
 ----
@@ -25,7 +33,7 @@ physical_plan	<REGEX>:.*MLX_SUM.*
 
 # exact equality with the CPU engine — decimals must match to the last digit
 statement ok
-SET VARIABLE gpu_q6 = (SELECT sum(price * disc) FROM td
+SET VARIABLE gpu_q6 = (SELECT [sum(price * disc)::VARCHAR, sum(qty)::VARCHAR, min(price)::VARCHAR] FROM td
 WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
   AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
 
@@ -35,14 +43,14 @@ SET VARIABLE gpu_aggs = (SELECT [min(price)::VARCHAR, max(price)::VARCHAR, sum(q
 
 # hot run serves from the cache
 query II
-EXPLAIN SELECT sum(price * disc) FROM td
+EXPLAIN SELECT sum(price * disc), sum(qty), min(price) FROM td
 WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
   AND disc BETWEEN 0.05 AND 0.07 AND qty < 24;
 ----
 physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
 
 statement ok
-SET VARIABLE gpu_q6_hot = (SELECT sum(price * disc) FROM td
+SET VARIABLE gpu_q6_hot = (SELECT [sum(price * disc)::VARCHAR, sum(qty)::VARCHAR, min(price)::VARCHAR] FROM td
 WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
   AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
 
@@ -50,7 +58,7 @@ statement ok
 SET mlx_execution = false;
 
 query I
-SELECT getvariable('gpu_q6') = (SELECT sum(price * disc) FROM td
+SELECT getvariable('gpu_q6') = (SELECT [sum(price * disc)::VARCHAR, sum(qty)::VARCHAR, min(price)::VARCHAR] FROM td
 WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
   AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
 ----

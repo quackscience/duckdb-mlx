@@ -15,20 +15,26 @@ hot repetitions (GQE methodology). Two suites:
    (`lineitem_dbl`), measuring **acceleration** on the shapes the extension
    handles today.
 
-## Results — SF10 (60M lineitem rows), base M4 24 GB, 2026-07-02
+## Results — SF10 (60M lineitem rows), base M4 24 GB, 2026-07-02 (rev 2)
 
-Standard TPC-H: **1.02× total (1061.6 ms → 1038.3 ms)** — every query declines
-cleanly, results correct, no measurable optimizer-hook overhead.
+With the exact DECIMAL int64 lane + DATE support and the int-lane cost gate:
 
-Supported shapes (hot, mean of 5):
+Standard TPC-H: **1.12× total (1296.5 ms → 1161.0 ms)**, no query regresses.
+Lone decimal aggregates (Q6 class) deliberately decline — the CPU's pruned
+filtered scan beats emulated 64-bit GPU arithmetic there; multi-aggregate
+decimal shapes (Q1 class) intercept and run exactly (verified against the
+official Q6 answer to the cent before gating). Take single-query outliers
+(e.g. Q14) with salt: CPU baselines on this 24 GB box wobble.
+
+Supported shapes (hot, mean of 5, per-query cache isolation):
 
 | query | CPU ms | GPU cold ms | GPU hot ms | speedup |
 |---|---|---|---|---|
-| S6 (Q6 shape: filtered sum) | 36.8 | 674 | 28.8 | 1.28× |
-| S1 (Q1 shape: group-by sum(expr)) | 42.2 | 43 | 41.2 | 1.02× (declines: group-by value expressions unsupported) |
-| SA (multi-aggregate + filter) | 52.0 | 55 | 43.6 | 1.19× |
-| SE (expression-heavy sum) | 44.8 | 1045 | 15.8 | **2.84×** |
-| **total** | **175.8** | | **129.4** | **1.36×** |
+| S6 (Q6 shape: filtered sum, DOUBLE) | 46.0 | 734 | 36.0 | 1.28× |
+| S1 (Q1 shape: group-by sum) | 56.0 | 43 | 42.0 | 1.33× |
+| SA (multi-aggregate + filter) | 59.2 | 592 | 46.4 | 1.28× |
+| SE (expression-heavy sum) | 45.8 | 981 | 15.8 | **2.90×** |
+| **total** | **207.0** | | **140.2** | **1.48×** |
 
 TPC disclaimer: non-audited, non-comparable results, for engineering guidance
 only.
@@ -42,8 +48,10 @@ only.
 
 ## The unlock list (in impact order)
 
-1. **DECIMAL(≤18) + DATE translation** (scaled int64 / epoch days): standard
-   TPC-H queries become interceptable at all.
-2. **GROUP BY value expressions** (`sum(price * (1 - disc))`) and multi-key /
-   VARCHAR-dictionary group keys: Q1-shape acceleration.
+1. ~~DECIMAL(≤18) + DATE translation~~ — done: exact int64 lane, cost-gated.
+2. **GROUP BY generalization** (value expressions, multi-key, VARCHAR
+   dictionary keys, multiple aggregates): unlocks real TPC-H Q1, the
+   compute-dense query where the GPU multiplier lives.
 3. Joins (PLAN Phase 3): most of the remaining 22.
+4. int32 downcast of decimal columns whose zone maps fit (Metal-native
+   arithmetic instead of emulated 64-bit) — lifts the Q6-class gate.

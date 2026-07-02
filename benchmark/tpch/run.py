@@ -60,6 +60,11 @@ def run_mode(db, queries, gpu, setup=""):
         script.append(setup)
     keys = {f"q{idx}": label for idx, (label, _) in enumerate(queries)}
     for idx, (label, sql) in enumerate(queries):
+        if gpu:
+            # isolate queries: each starts cold, and resident caches from
+            # earlier queries don't build up memory pressure
+            script.append("SELECT '##CLEAR##';")
+            script.append("SELECT mlx_cache_clear();")
         for i in range(REPEATS + 1):
             script.append(f"SELECT '##q{idx}#{i}';")
             script.append(sql if sql.endswith(";") else sql + ";")
@@ -72,6 +77,9 @@ def run_mode(db, queries, gpu, setup=""):
     current = None
     pending_marker_time = False
     for line in proc.stdout.splitlines():
+        if "##CLEAR##" in line:
+            current = None
+            continue
         marker = re.search(r"##(q\d+)#(\d+)", line)
         if marker:
             current = keys[marker.group(1)]

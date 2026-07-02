@@ -1185,6 +1185,25 @@ static bool ProgramsAreCpuFast(const vector<duckdb_mlx::MlxSumProgram> &programs
 	return IsPlainColumnProgram(programs[0]);
 }
 
+//! Cost gate for the exact int64 lane: 64-bit arithmetic is emulated on
+//! Apple GPUs and the CPU's filtered scan reads only surviving row groups,
+//! so a lone decimal aggregate (TPC-H Q6 class) loses to the CPU. Multi-
+//! aggregate decimal queries (Q1 class) amortize the column reads and win.
+static bool IntLaneCpuFast(const vector<duckdb_mlx::MlxSumProgram> &programs) {
+	idx_t int_lane_values = 0;
+	idx_t value_programs = 0;
+	for (auto &program : programs) {
+		if (program.kind == duckdb_mlx::MlxAggKind::COUNT_STAR) {
+			continue;
+		}
+		value_programs++;
+		if (program.int_lane) {
+			int_lane_values++;
+		}
+	}
+	return int_lane_values > 0 && value_programs < 3;
+}
+
 //===--------------------------------------------------------------------===//
 // Optimizer hook: match AGGREGATE <- [PROJECTION] <- [FILTER] <- GET and
 // replace. Sirius-style: DuckDB scan applies table_filters; residual FILTER
@@ -1900,6 +1919,9 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 
 	// Plain single-column aggs are scan-bound on CPU — always decline (cold or cached).
 	if (ProgramsAreCpuFast(programs)) {
+		return false;
+	}
+	if (IntLaneCpuFast(programs)) {
 		return false;
 	}
 
