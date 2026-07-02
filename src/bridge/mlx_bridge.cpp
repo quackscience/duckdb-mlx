@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -214,17 +215,34 @@ bool HasValueGraph(MlxAggKind kind) {
 	return kind != MlxAggKind::COUNT && kind != MlxAggKind::COUNT_STAR;
 }
 
+enum class EvalRowWidth : uint8_t { INT64, INT32, FP32 };
+
 //! Evaluates a postfix program over the segment's columns.
-mx::array EvalOps(const MlxSegment &segment, const std::vector<MlxExprOp> &ops) {
+mx::array EvalOps(const MlxSegment &segment, const std::vector<MlxExprOp> &ops,
+                  EvalRowWidth width = EvalRowWidth::INT64) {
 	std::vector<mx::array> stack;
 	for (auto &op : ops) {
 		switch (op.code) {
-		case MlxExprOpCode::LOAD_COL:
-			stack.push_back(segment.cols[op.col]);
+		case MlxExprOpCode::LOAD_COL: {
+			auto col = segment.cols[op.col];
+			if (width == EvalRowWidth::INT32) {
+				stack.push_back(mx::astype(col, mx::int32));
+			} else if (width == EvalRowWidth::FP32) {
+				stack.push_back(mx::astype(col, mx::float32));
+			} else {
+				stack.push_back(col);
+			}
 			break;
+		}
 		case MlxExprOpCode::CONST_VAL:
 			if (op.int_lane) {
-				stack.push_back(mx::array(op.ivalue, mx::int64));
+				if (width == EvalRowWidth::INT32) {
+					stack.push_back(mx::array(static_cast<int32_t>(op.ivalue), mx::int32));
+				} else if (width == EvalRowWidth::FP32) {
+					stack.push_back(mx::array(static_cast<float>(op.ivalue), mx::float32));
+				} else {
+					stack.push_back(mx::array(op.ivalue, mx::int64));
+				}
 			} else {
 				stack.push_back(mx::array(static_cast<float>(op.value)));
 			}
@@ -414,6 +432,117 @@ void MergeSegmentOutputs(const MlxSegment &segment, const std::vector<MlxSumProg
 	}
 }
 
+namespace {
+
+struct SegmentPrunePred {
+	int32_t col;
+	MlxExprOpCode code;
+	double constant;
+	int64_t iconst;
+	bool int_lane;
+};
+
+bool BuildSegmentPrunePreds(const MlxFilter &filter, std::vector<SegmentPrunePred> &preds) {
+	preds.clear();
+	if (filter.ops.empty()) {
+		return false;
+	}
+	size_t i = 0;
+	auto parse_cmp = [&]() -> bool {
+		if (i + 3 > filter.ops.size()) {
+			return false;
+		}
+		if (filter.ops[i].code != MlxExprOpCode::LOAD_COL || filter.ops[i + 1].code != MlxExprOpCode::CONST_VAL) {
+			return false;
+		}
+		auto cmp = filter.ops[i + 2].code;
+		if (cmp < MlxExprOpCode::CMP_LT || cmp > MlxExprOpCode::CMP_NE) {
+			return false;
+		}
+		auto &konst = filter.ops[i + 1];
+		preds.push_back({filter.ops[i].col, cmp, konst.value, konst.ivalue, konst.int_lane});
+		i += 3;
+		return true;
+	};
+	if (!parse_cmp()) {
+		return false;
+	}
+	while (i < filter.ops.size()) {
+		if (filter.ops[i].code != MlxExprOpCode::AND) {
+			preds.clear();
+			return false;
+		}
+		i++;
+		if (!parse_cmp()) {
+			preds.clear();
+			return false;
+		}
+	}
+	return !preds.empty();
+}
+
+bool SegmentShouldPrune(size_t seg_idx, const std::vector<SegmentPrunePred> &preds,
+                        const std::vector<std::vector<MlxZoneMap>> &segment_zone_maps) {
+	if (preds.empty()) {
+		return false;
+	}
+	for (auto &pred : preds) {
+		if (pred.col < 0 || static_cast<size_t>(pred.col) >= segment_zone_maps.size()) {
+			return false;
+		}
+		if (seg_idx >= segment_zone_maps[pred.col].size()) {
+			return false;
+		}
+		auto &zm = segment_zone_maps[pred.col][seg_idx];
+		if (pred.int_lane != zm.int_lane) {
+			return false;
+		}
+		auto lo = zm.int_lane ? static_cast<double>(zm.imin) : zm.min_val;
+		auto hi = zm.int_lane ? static_cast<double>(zm.imax) : zm.max_val;
+		auto ilo = zm.imin;
+		auto ihi = zm.imax;
+		auto c = pred.constant;
+		auto ic = pred.iconst;
+		switch (pred.code) {
+		case MlxExprOpCode::CMP_LT:
+			if (zm.int_lane ? ilo >= ic : lo >= c) {
+				return true;
+			}
+			break;
+		case MlxExprOpCode::CMP_LE:
+			if (zm.int_lane ? ilo > ic : lo > c) {
+				return true;
+			}
+			break;
+		case MlxExprOpCode::CMP_GT:
+			if (zm.int_lane ? ihi <= ic : hi <= c) {
+				return true;
+			}
+			break;
+		case MlxExprOpCode::CMP_GE:
+			if (zm.int_lane ? ihi < ic : hi < c) {
+				return true;
+			}
+			break;
+		case MlxExprOpCode::CMP_EQ:
+			if (zm.int_lane ? (ic < ilo || ic > ihi) : (c < lo || c > hi)) {
+				return true;
+			}
+			break;
+		case MlxExprOpCode::CMP_NE:
+			if (!zm.has_null && (zm.int_lane ? (ilo == ihi && ilo == ic) : (lo == hi && lo == c))) {
+				return true;
+			}
+			break;
+		default:
+			return false;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
 std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
                                        const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
                                        const std::vector<std::vector<MlxZoneMap>> *segment_zone_maps,
@@ -433,105 +562,13 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 		}
 	}
 
-	struct PrunePred {
-		int32_t col;
-		MlxExprOpCode code;
-		double constant; // fp32-lane compare bound
-		int64_t iconst;  // exact bound for int-lane columns
-		bool int_lane;
-	};
-	std::vector<PrunePred> prune_preds;
-	if (segment_zone_maps && !filter.ops.empty()) {
-		size_t i = 0;
-		auto parse_cmp = [&]() -> bool {
-			if (i + 3 > filter.ops.size()) {
-				return false;
-			}
-			if (filter.ops[i].code != MlxExprOpCode::LOAD_COL || filter.ops[i + 1].code != MlxExprOpCode::CONST_VAL) {
-				return false;
-			}
-			auto cmp = filter.ops[i + 2].code;
-			if (cmp < MlxExprOpCode::CMP_LT || cmp > MlxExprOpCode::CMP_NE) {
-				return false;
-			}
-			auto &konst = filter.ops[i + 1];
-			prune_preds.push_back({filter.ops[i].col, cmp, konst.value, konst.ivalue, konst.int_lane});
-			i += 3;
-			return true;
-		};
-		if (parse_cmp()) {
-			while (i < filter.ops.size()) {
-				if (filter.ops[i].code != MlxExprOpCode::AND) {
-					prune_preds.clear();
-					break;
-				}
-				i++;
-				if (!parse_cmp()) {
-					prune_preds.clear();
-					break;
-				}
-			}
-		}
+	std::vector<SegmentPrunePred> prune_preds;
+	if (segment_zone_maps) {
+		BuildSegmentPrunePreds(filter, prune_preds);
 	}
 
 	auto segment_pruned = [&](size_t seg_idx) {
-		if (!segment_zone_maps || prune_preds.empty()) {
-			return false;
-		}
-		for (auto &pred : prune_preds) {
-			if (pred.col < 0 || static_cast<size_t>(pred.col) >= segment_zone_maps->size()) {
-				return false;
-			}
-			if (seg_idx >= (*segment_zone_maps)[pred.col].size()) {
-				return false;
-			}
-			auto &zm = (*segment_zone_maps)[pred.col][seg_idx];
-			if (pred.int_lane != zm.int_lane) {
-				return false; // lane mismatch: never prune
-			}
-			// exact int64 bounds for the int lane; double bounds otherwise
-			auto lo = zm.int_lane ? static_cast<double>(zm.imin) : zm.min_val;
-			auto hi = zm.int_lane ? static_cast<double>(zm.imax) : zm.max_val;
-			auto ilo = zm.imin;
-			auto ihi = zm.imax;
-			auto c = pred.constant;
-			auto ic = pred.iconst;
-			switch (pred.code) {
-			case MlxExprOpCode::CMP_LT:
-				if (zm.int_lane ? ilo >= ic : lo >= c) {
-					return true;
-				}
-				break;
-			case MlxExprOpCode::CMP_LE:
-				if (zm.int_lane ? ilo > ic : lo > c) {
-					return true;
-				}
-				break;
-			case MlxExprOpCode::CMP_GT:
-				if (zm.int_lane ? ihi <= ic : hi <= c) {
-					return true;
-				}
-				break;
-			case MlxExprOpCode::CMP_GE:
-				if (zm.int_lane ? ihi < ic : hi < c) {
-					return true;
-				}
-				break;
-			case MlxExprOpCode::CMP_EQ:
-				if (zm.int_lane ? (ic < ilo || ic > ihi) : (c < lo || c > hi)) {
-					return true;
-				}
-				break;
-			case MlxExprOpCode::CMP_NE:
-				if (!zm.has_null && (zm.int_lane ? (ilo == ihi && ilo == ic) : (lo == hi && lo == c))) {
-					return true;
-				}
-				break;
-			default:
-				return false;
-			}
-		}
-		return false;
+		return segment_zone_maps && SegmentShouldPrune(seg_idx, prune_preds, *segment_zone_maps);
 	};
 
 	std::vector<mx::array> all;
@@ -623,6 +660,9 @@ struct MlxCachedColumn {
 	std::vector<mx::array> segments;
 	std::vector<std::optional<mx::array>> valids;
 	std::vector<MlxZoneMap> zone_maps;
+	//! One contiguous GPU-resident column (fused at pin / population end).
+	std::optional<mx::array> fused_col;
+	std::optional<mx::array> fused_valid;
 	int64_t rows = 0;
 	int64_t population = 0;
 };
@@ -693,6 +733,8 @@ void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t
 	if (take == 0) {
 		return;
 	}
+	cached.fused_col = std::nullopt;
+	cached.fused_valid = std::nullopt;
 	mx::Shape shape {static_cast<int>(take)};
 	auto valid_ptr = col.valid ? col.valid + offset : nullptr;
 	if (col.ivalues) {
@@ -711,6 +753,43 @@ void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t
 	cached.population = population;
 }
 
+mx::array ConcatArraysBalanced(const std::vector<mx::array> &parts) {
+	if (parts.empty()) {
+		return mx::zeros({0}, mx::float32);
+	}
+	if (parts.size() == 1) {
+		return parts[0];
+	}
+	if (parts.size() == 2) {
+		return mx::concatenate(parts, 0);
+	}
+	size_t mid = parts.size() / 2;
+	return mx::concatenate({ConcatArraysBalanced({parts.begin(), parts.begin() + static_cast<std::ptrdiff_t>(mid)}),
+	                        ConcatArraysBalanced({parts.begin() + static_cast<std::ptrdiff_t>(mid), parts.end()})},
+	                       0);
+}
+
+void FuseCachedColumnUnlocked(MlxCachedColumn &cached) {
+	if (cached.segments.empty() || cached.fused_col.has_value()) {
+		return;
+	}
+	if (cached.segments.size() == 1) {
+		cached.fused_col = cached.segments[0];
+	} else {
+		cached.fused_col = ConcatArraysBalanced(cached.segments);
+	}
+	std::vector<mx::array> valid_parts;
+	for (auto &v : cached.valids) {
+		if (v.has_value()) {
+			valid_parts.push_back(*v);
+		}
+	}
+	if (!valid_parts.empty()) {
+		cached.fused_valid =
+		    valid_parts.size() == 1 ? valid_parts[0] : ConcatArraysBalanced(valid_parts);
+	}
+}
+
 std::vector<size_t> CanonicalSegmentSizesUnlocked(const std::string &table_prefix) {
 	for (auto &entry : CacheStore()) {
 		if (entry.first.compare(0, table_prefix.size(), table_prefix) == 0 && !entry.second.segments.empty()) {
@@ -726,6 +805,26 @@ std::vector<size_t> CanonicalSegmentSizesUnlocked(const std::string &table_prefi
 }
 
 } // namespace
+
+void MlxCacheFuseTable(const std::string &table_prefix) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	std::vector<mx::array> to_eval;
+	for (auto &entry : CacheStore()) {
+		if (entry.first.compare(0, table_prefix.size(), table_prefix) != 0) {
+			continue;
+		}
+		FuseCachedColumnUnlocked(entry.second);
+		if (entry.second.fused_col.has_value()) {
+			to_eval.push_back(*entry.second.fused_col);
+		}
+		if (entry.second.fused_valid.has_value()) {
+			to_eval.push_back(*entry.second.fused_valid);
+		}
+	}
+	if (!to_eval.empty()) {
+		mx::eval(to_eval);
+	}
+}
 
 std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, size_t count,
                                       const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
@@ -1028,6 +1127,1016 @@ std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key,
 	// full path (dense window, else sort+scatter) — dense alone returns empty
 	// for wide key spans
 	return MlxGroupbySumArrays(keys, vals, false);
+}
+
+//===--------------------------------------------------------------------===//
+// Generalized grouped aggregation: GPU evaluates codes/masks/expressions,
+// then scatter_add into dense accumulators (GQE cuDF-style groupby on Metal).
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+struct GroupedSegmentArrays {
+	mx::array codes;                              // int32; == card for filtered rows
+	std::vector<std::optional<mx::array>> exprs;  // per program value arrays
+	std::vector<std::optional<mx::array>> masks;  // per program NULL masks (uint8)
+	int64_t count = 0;
+
+	GroupedSegmentArrays() : codes(mx::zeros({0}, mx::int32)) {
+	}
+};
+
+EvalRowWidth ProgramEvalWidth(const MlxSumProgram &program) {
+	if (program.int_lane && program.int32_rows) {
+		return EvalRowWidth::INT32;
+	}
+	if (program.int_lane && program.gpu_fp32_rows) {
+		return EvalRowWidth::FP32;
+	}
+	return EvalRowWidth::INT64;
+}
+
+int64_t GpuScatterChunkRows(const std::vector<MlxSumProgram> &programs) {
+	int64_t chunk = 2048;
+	for (auto &program : programs) {
+		if (!program.int_lane || (program.kind != MlxAggKind::SUM && program.kind != MlxAggKind::AVG)) {
+			continue;
+		}
+		if (!program.int32_rows && !program.gpu_fp32_rows) {
+			continue;
+		}
+		auto bound = std::max(program.row_abs_bound, 1.0);
+		auto limit = program.int32_rows ? (2147483647.0 / bound) : (16777216.0 / bound);
+		chunk = std::min(chunk, std::max<int64_t>(1, static_cast<int64_t>(limit)));
+	}
+	return chunk;
+}
+
+GroupedSegmentArrays SliceGroupedSegment(const GroupedSegmentArrays &seg, int64_t begin, int64_t end) {
+	GroupedSegmentArrays out;
+	out.count = end - begin;
+	out.codes = mx::slice(seg.codes, {static_cast<int>(begin)}, {static_cast<int>(end)});
+	for (auto &e : seg.exprs) {
+		out.exprs.push_back(e.has_value()
+		                        ? std::optional<mx::array>(
+		                              mx::slice(*e, {static_cast<int>(begin)}, {static_cast<int>(end)}))
+		                        : std::nullopt);
+	}
+	for (auto &m : seg.masks) {
+		out.masks.push_back(m.has_value()
+		                        ? std::optional<mx::array>(
+		                              mx::slice(*m, {static_cast<int>(begin)}, {static_cast<int>(end)}))
+		                        : std::nullopt);
+	}
+	return out;
+}
+
+struct GroupedGpuAcc {
+	mx::array rows;   // (card,) int32 — filter-passing row counts
+	mx::array counts; // (card * nprogs,) int32
+	mx::array isums;  // (card * nprogs,) int32 — int-lane SUM/AVG partials
+	mx::array fsums;  // (card * nprogs,) float32
+	int64_t card = 0;
+	size_t nprogs = 0;
+
+	GroupedGpuAcc(int64_t card_p, size_t nprogs_p)
+	    : rows(mx::zeros({static_cast<int>(card_p)}, mx::int32)),
+	      counts(mx::zeros({static_cast<int>(card_p * static_cast<int64_t>(nprogs_p))}, mx::int32)),
+	      isums(mx::zeros({static_cast<int>(card_p * static_cast<int64_t>(nprogs_p))}, mx::int32)),
+	      fsums(mx::zeros({static_cast<int>(card_p * static_cast<int64_t>(nprogs_p))}, mx::float32)), card(card_p),
+	      nprogs(nprogs_p) {
+	}
+};
+
+std::mutex &GroupedGpuMutex() {
+	static std::mutex m;
+	return m;
+}
+
+std::unordered_map<int64_t, GroupedGpuAcc> &GroupedGpuStore() {
+	static std::unordered_map<int64_t, GroupedGpuAcc> store;
+	return store;
+}
+
+std::atomic<int64_t> &GroupedGpuNextId() {
+	static std::atomic<int64_t> next_id {0};
+	return next_id;
+}
+
+bool ProgramsNeedCpuScatter(const std::vector<MlxSumProgram> &programs) {
+	(void)programs;
+	return false;
+}
+
+int64_t GroupedGpuOpen(const MlxGroupedState &state, const std::vector<MlxSumProgram> &programs) {
+	if (state.card <= 0 || state.card > 65536) {
+		return -1;
+	}
+	GroupedGpuAcc acc(state.card, programs.size());
+	auto id = GroupedGpuNextId().fetch_add(1);
+	std::lock_guard<std::mutex> guard(GroupedGpuMutex());
+	GroupedGpuStore().emplace(id, std::move(acc));
+	return id;
+}
+
+void GroupedGpuClose(int64_t handle) {
+	std::lock_guard<std::mutex> guard(GroupedGpuMutex());
+	GroupedGpuStore().erase(handle);
+}
+
+GroupedGpuAcc *GroupedGpuLookup(int64_t handle) {
+	std::lock_guard<std::mutex> guard(GroupedGpuMutex());
+	auto it = GroupedGpuStore().find(handle);
+	return it == GroupedGpuStore().end() ? nullptr : &it->second;
+}
+
+static constexpr int64_t kDenseReduceCard = 512;
+//! Max rows per fused cached eval for low-cardinality GROUP BY (few syncs).
+static constexpr int64_t kDenseCachedBatchRows = 8 * 1024 * 1024;
+
+mx::array ConcatArrays(const std::vector<mx::array> &parts) {
+	if (parts.empty()) {
+		return mx::zeros({0}, mx::float32);
+	}
+	if (parts.size() == 1) {
+		return parts[0];
+	}
+	if (parts.size() == 2) {
+		return mx::concatenate(parts, 0);
+	}
+	size_t mid = parts.size() / 2;
+	return mx::concatenate({ConcatArrays({parts.begin(), parts.begin() + static_cast<std::ptrdiff_t>(mid)}),
+	                        ConcatArrays({parts.begin() + static_cast<std::ptrdiff_t>(mid), parts.end()})},
+	                       0);
+}
+
+MlxSegment ConcatSegmentParts(const std::vector<MlxSegment> &segments, size_t begin, size_t end) {
+	MlxSegment out;
+	if (begin >= end) {
+		return out;
+	}
+	auto ncols = segments[begin].cols.size();
+	out.cols.reserve(ncols);
+	out.valids.reserve(ncols);
+	for (size_t c = 0; c < ncols; c++) {
+		std::vector<mx::array> col_parts;
+		std::vector<mx::array> val_parts;
+		bool has_valid = false;
+		for (size_t s = begin; s < end; s++) {
+			if (segments[s].count <= 0) {
+				continue;
+			}
+			col_parts.push_back(segments[s].cols[c]);
+			if (segments[s].valids[c].has_value()) {
+				has_valid = true;
+				val_parts.push_back(*segments[s].valids[c]);
+			}
+		}
+		if (col_parts.empty()) {
+			out.cols.push_back(mx::zeros({0}, segments[begin].cols[c].dtype()));
+		} else {
+			out.cols.push_back(ConcatArrays(col_parts));
+		}
+		if (has_valid) {
+			out.valids.push_back(ConcatArrays(val_parts));
+		} else {
+			out.valids.push_back(std::nullopt);
+		}
+	}
+	out.count = 0;
+	for (size_t s = begin; s < end; s++) {
+		out.count += segments[s].count;
+	}
+	return out;
+}
+
+GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGroupedSpec &spec,
+                                        const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
+                                        bool exact_int_eval = false, bool defer_materialize = false) {
+	GroupedSegmentArrays out;
+	out.count = segment.count;
+	int64_t card = 1;
+	for (auto c : spec.key_cards) {
+		card *= c;
+	}
+
+	// combined dense code per row
+	std::optional<mx::array> code;
+	for (size_t k = 0; k < spec.key_cols.size(); k++) {
+		auto &col = segment.cols[spec.key_cols[k]];
+		mx::array c32 = col.dtype() == mx::int64
+		                    ? mx::astype(mx::subtract(col, mx::array(spec.key_offsets[k], mx::int64)), mx::int32)
+		                    : mx::astype(mx::subtract(col, mx::array(static_cast<float>(spec.key_offsets[k]))),
+		                                 mx::int32);
+		code = code.has_value()
+		           ? mx::add(mx::multiply(*code, mx::array(static_cast<int32_t>(spec.key_cards[k]), mx::int32)), c32)
+		           : c32;
+	}
+
+	// WHERE filter (and key NULLs) dump rows to slot `card`; also clamp any
+	// out-of-stats code defensively
+	std::optional<mx::array> fmask;
+	if (!filter.ops.empty()) {
+		fmask = EvalOps(segment, filter.ops);
+	}
+	fmask = CombineMasks(fmask, NullMask(segment, filter.null_cols));
+	auto dump = mx::array(static_cast<int32_t>(card), mx::int32);
+	auto in_range = mx::logical_and(mx::greater_equal(*code, mx::array(0, mx::int32)), mx::less(*code, dump));
+	auto guarded = fmask.has_value() ? mx::logical_and(in_range, *fmask) : in_range;
+	out.codes = mx::where(guarded, *code, dump);
+
+	for (auto &program : programs) {
+		if (HasValueGraph(program.kind)) {
+			auto width = ProgramEvalWidth(program);
+			if (exact_int_eval && program.int_lane) {
+				width = EvalRowWidth::INT64;
+			}
+			out.exprs.emplace_back(EvalOps(segment, program.ops, width));
+		} else {
+			out.exprs.emplace_back(std::nullopt);
+		}
+		auto nmask = NullMask(segment, program.null_cols);
+		if (nmask.has_value()) {
+			out.masks.emplace_back(mx::astype(*nmask, mx::uint8));
+		} else {
+			out.masks.emplace_back(std::nullopt);
+		}
+	}
+
+	std::vector<mx::array> to_eval = {out.codes};
+	for (auto &e : out.exprs) {
+		if (e.has_value()) {
+			to_eval.push_back(*e);
+		}
+	}
+	for (auto &m : out.masks) {
+		if (m.has_value()) {
+			to_eval.push_back(*m);
+		}
+	}
+	if (!defer_materialize) {
+		mx::eval(to_eval);
+	}
+	return out;
+}
+
+void GroupedCpuScatterInt(MlxGroupedState &state, const GroupedSegmentArrays &seg, const std::vector<MlxSumProgram> &programs) {
+	auto n = seg.count;
+	if (n == 0) {
+		return;
+	}
+	auto card = state.card;
+	auto nprogs = programs.size();
+	auto codes = seg.codes.data<int32_t>();
+	for (size_t p = 0; p < nprogs; p++) {
+		if (!programs[p].int_lane || !seg.exprs[p].has_value()) {
+			continue;
+		}
+		auto kind = programs[p].kind;
+		if (kind == MlxAggKind::SUM || kind == MlxAggKind::AVG) {
+			if (programs[p].int32_rows || programs[p].gpu_fp32_rows) {
+				continue;
+			}
+		} else if (kind != MlxAggKind::MIN && kind != MlxAggKind::MAX) {
+			continue;
+		}
+		const int64_t *iexpr = seg.exprs[p]->data<int64_t>();
+		const int32_t *i32expr = programs[p].int32_rows ? seg.exprs[p]->data<int32_t>() : nullptr;
+		const uint8_t *pmask = seg.masks[p].has_value() ? seg.masks[p]->data<uint8_t>() : nullptr;
+		for (size_t i = 0; i < static_cast<size_t>(n); i++) {
+			auto g = codes[i];
+			if (g < 0 || g >= card || (pmask && !pmask[i])) {
+				continue;
+			}
+			auto slot = static_cast<size_t>(g) * nprogs + p;
+			auto v = i32expr ? static_cast<__int128>(i32expr[i]) : static_cast<__int128>(iexpr[i]);
+			if (kind == MlxAggKind::SUM || kind == MlxAggKind::AVG) {
+				state.ivalues[slot] += v;
+			} else if (kind == MlxAggKind::MIN) {
+				state.ivalues[slot] = std::min(state.ivalues[slot], v);
+			} else {
+				state.ivalues[slot] = std::max(state.ivalues[slot], v);
+			}
+		}
+	}
+}
+
+void GroupedDenseGpuReduceMerge(MlxGroupedState &state, const GroupedSegmentArrays &seg,
+                                const std::vector<MlxSumProgram> &programs, std::vector<mx::array> &outs) {
+	auto card = state.card;
+	auto nprogs = programs.size();
+	size_t cursor = 0;
+	for (int64_t g = 0; g < card; g++) {
+		state.rows[static_cast<size_t>(g)] += outs[cursor++].item<int32_t>();
+	}
+	for (size_t p = 0; p < nprogs; p++) {
+		auto kind = programs[p].kind;
+		if (kind == MlxAggKind::COUNT_STAR) {
+			continue;
+		}
+		for (int64_t g = 0; g < card; g++) {
+			auto slot = static_cast<size_t>(g) * nprogs + p;
+			if (kind == MlxAggKind::COUNT || !seg.exprs[p].has_value()) {
+				state.counts[slot] += outs[cursor++].item<int32_t>();
+				continue;
+			}
+			switch (kind) {
+			case MlxAggKind::SUM:
+			case MlxAggKind::AVG:
+				if (programs[p].int_lane) {
+					state.ivalues[slot] += static_cast<__int128>(outs[cursor++].item<int64_t>());
+				} else {
+					state.fvalues[slot] += static_cast<double>(outs[cursor++].item<float>());
+				}
+				state.counts[slot] += outs[cursor++].item<int32_t>();
+				break;
+			case MlxAggKind::MIN:
+			case MlxAggKind::MAX: {
+				auto cnt = outs[cursor + 1].item<int32_t>();
+				if (cnt > 0) {
+					if (programs[p].int_lane) {
+						auto v = static_cast<__int128>(outs[cursor].item<int64_t>());
+						state.ivalues[slot] = kind == MlxAggKind::MIN ? std::min(state.ivalues[slot], v)
+						                                              : std::max(state.ivalues[slot], v);
+					} else {
+						auto v = static_cast<double>(outs[cursor].item<float>());
+						state.fvalues[slot] = kind == MlxAggKind::MIN ? std::min(state.fvalues[slot], v)
+						                                              : std::max(state.fvalues[slot], v);
+					}
+				}
+				cursor += 2;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+	}
+}
+
+void GroupedDenseGpuReduce(MlxGroupedState &state, const GroupedSegmentArrays &seg,
+                           const std::vector<MlxSumProgram> &programs, bool defer_materialize = false,
+                           std::vector<mx::array> *reduce_outs = nullptr) {
+	if (seg.count == 0) {
+		return;
+	}
+	auto card = state.card;
+	auto nprogs = programs.size();
+	auto dump = mx::array(static_cast<int32_t>(card), mx::int32);
+	auto zero_i32 = mx::array(static_cast<int32_t>(0), mx::int32);
+	auto in_range = mx::logical_and(mx::greater_equal(seg.codes, zero_i32), mx::less(seg.codes, dump));
+
+	std::vector<mx::array> gmasks;
+	gmasks.reserve(static_cast<size_t>(card));
+	for (int64_t g = 0; g < card; g++) {
+		auto gcode = mx::array(static_cast<int32_t>(g), mx::int32);
+		gmasks.push_back(mx::logical_and(in_range, mx::equal(seg.codes, gcode)));
+	}
+
+	std::vector<mx::array> outs;
+	for (int64_t g = 0; g < card; g++) {
+		outs.push_back(mx::sum(mx::astype(gmasks[static_cast<size_t>(g)], mx::int32)));
+	}
+
+	for (size_t p = 0; p < nprogs; p++) {
+		auto kind = programs[p].kind;
+		if (kind == MlxAggKind::COUNT_STAR) {
+			continue;
+		}
+		for (int64_t g = 0; g < card; g++) {
+			auto gmask = gmasks[static_cast<size_t>(g)];
+			if (seg.masks[p].has_value()) {
+				gmask = mx::logical_and(gmask, *seg.masks[p]);
+			}
+			if (kind == MlxAggKind::COUNT || !seg.exprs[p].has_value()) {
+				outs.push_back(mx::sum(mx::astype(gmask, mx::int32)));
+				continue;
+			}
+			auto val = *seg.exprs[p];
+			switch (kind) {
+			case MlxAggKind::SUM:
+			case MlxAggKind::AVG: {
+				auto neutral = programs[p].int_lane ? mx::array(static_cast<int64_t>(0), mx::int64) : mx::array(0.0f);
+				outs.push_back(mx::sum(mx::where(gmask, val, neutral)));
+				outs.push_back(mx::sum(mx::astype(gmask, mx::int32)));
+				break;
+			}
+			case MlxAggKind::MIN: {
+				auto neutral = programs[p].int_lane
+				                   ? mx::array(std::numeric_limits<int64_t>::max(), mx::int64)
+				                   : mx::array(std::numeric_limits<float>::infinity());
+				outs.push_back(mx::min(mx::where(gmask, val, neutral)));
+				outs.push_back(mx::sum(mx::astype(gmask, mx::int32)));
+				break;
+			}
+			case MlxAggKind::MAX: {
+				auto neutral = programs[p].int_lane
+				                   ? mx::array(std::numeric_limits<int64_t>::min(), mx::int64)
+				                   : mx::array(-std::numeric_limits<float>::infinity());
+				outs.push_back(mx::max(mx::where(gmask, val, neutral)));
+				outs.push_back(mx::sum(mx::astype(gmask, mx::int32)));
+				break;
+			}
+			default:
+				break;
+			}
+		}
+	}
+	if (defer_materialize) {
+		if (reduce_outs) {
+			*reduce_outs = std::move(outs);
+		}
+		return;
+	}
+	mx::eval(outs);
+	GroupedDenseGpuReduceMerge(state, seg, programs, outs);
+}
+
+void GroupedGpuFlushPartials(MlxGroupedState &state, GroupedGpuAcc &acc, const std::vector<MlxSumProgram> &programs) {
+	mx::eval({acc.isums, acc.fsums});
+	auto isums_ptr = acc.isums.data<int32_t>();
+	auto fsums_ptr = acc.fsums.data<float>();
+	bool used_isums = false;
+	bool used_fp32 = false;
+	for (int64_t g = 0; g < acc.card; g++) {
+		for (size_t p = 0; p < acc.nprogs; p++) {
+			auto kind = programs[p].kind;
+			if (!programs[p].int_lane || (kind != MlxAggKind::SUM && kind != MlxAggKind::AVG)) {
+				continue;
+			}
+			auto slot = static_cast<size_t>(g) * acc.nprogs + p;
+			if (programs[p].int32_rows) {
+				state.ivalues[slot] += static_cast<__int128>(isums_ptr[slot]);
+				used_isums = true;
+			} else if (programs[p].gpu_fp32_rows) {
+				state.ivalues[slot] += static_cast<__int128>(std::llround(static_cast<double>(fsums_ptr[slot])));
+				used_fp32 = true;
+			}
+		}
+	}
+	if (used_isums) {
+		acc.isums = mx::zeros_like(acc.isums);
+	}
+	if (used_fp32) {
+		acc.fsums = mx::zeros_like(acc.fsums);
+	}
+}
+
+void GroupedGpuScatter(GroupedGpuAcc &acc, const GroupedSegmentArrays &seg, const std::vector<MlxSumProgram> &programs) {
+	if (seg.count == 0) {
+		return;
+	}
+	auto nprogs = acc.nprogs;
+	auto codes = seg.codes;
+	auto dump = mx::array(static_cast<int32_t>(acc.card), mx::int32);
+	auto zero_i32 = mx::array(static_cast<int32_t>(0), mx::int32);
+	auto in_range = mx::logical_and(mx::greater_equal(codes, zero_i32), mx::less(codes, dump));
+	auto safe_codes = mx::where(in_range, codes, dump);
+	auto nprogs_arr = mx::array(static_cast<int32_t>(nprogs), mx::int32);
+
+	auto row_up = mx::expand_dims(mx::astype(in_range, mx::int32), 1);
+	acc.rows = mx::scatter_add(acc.rows, safe_codes, row_up, 0);
+
+	std::vector<mx::array> to_eval = {acc.rows};
+	for (size_t p = 0; p < nprogs; p++) {
+		auto kind = programs[p].kind;
+		if (kind == MlxAggKind::COUNT_STAR) {
+			continue;
+		}
+		auto linear =
+		    mx::add(mx::multiply(safe_codes, nprogs_arr), mx::array(static_cast<int32_t>(p), mx::int32));
+
+		if (kind == MlxAggKind::COUNT || !seg.exprs[p].has_value()) {
+			auto pass = mx::astype(in_range, mx::int32);
+			if (seg.masks[p].has_value()) {
+				pass = mx::where(*seg.masks[p], pass, zero_i32);
+			}
+			acc.counts = mx::scatter_add(acc.counts, linear, mx::expand_dims(pass, 1), 0);
+			to_eval.push_back(acc.counts);
+			continue;
+		}
+		if (kind != MlxAggKind::SUM && kind != MlxAggKind::AVG) {
+			continue;
+		}
+		if (programs[p].int_lane) {
+			auto val = *seg.exprs[p];
+			if (seg.masks[p].has_value()) {
+				val = mx::where(*seg.masks[p], val, mx::zeros_like(val));
+			}
+			val = mx::where(in_range, val, mx::zeros_like(val));
+			if (programs[p].int32_rows) {
+				acc.isums = mx::scatter_add(acc.isums, linear, mx::expand_dims(val, 1), 0);
+				to_eval.push_back(acc.isums);
+			} else if (programs[p].gpu_fp32_rows) {
+				acc.fsums = mx::scatter_add(acc.fsums, linear, mx::expand_dims(val, 1), 0);
+				to_eval.push_back(acc.fsums);
+			}
+			auto cnt = mx::where(in_range, mx::ones_like(codes), mx::zeros_like(codes));
+			if (seg.masks[p].has_value()) {
+				cnt = mx::where(*seg.masks[p], cnt, mx::zeros_like(codes));
+			}
+			acc.counts = mx::scatter_add(acc.counts, linear, mx::expand_dims(mx::astype(cnt, mx::int32), 1), 0);
+			to_eval.push_back(acc.counts);
+			continue;
+		}
+		auto val = *seg.exprs[p];
+		if (seg.masks[p].has_value()) {
+			val = mx::where(*seg.masks[p], val, mx::zeros_like(val));
+		}
+		val = mx::where(in_range, val, mx::zeros_like(val));
+		val = mx::astype(val, mx::float32);
+		acc.fsums = mx::scatter_add(acc.fsums, linear, mx::expand_dims(val, 1), 0);
+		auto cnt = mx::where(in_range, mx::ones_like(codes), mx::zeros_like(codes));
+		if (seg.masks[p].has_value()) {
+			cnt = mx::where(*seg.masks[p], cnt, mx::zeros_like(codes));
+		}
+		acc.counts = mx::scatter_add(acc.counts, linear, mx::expand_dims(mx::astype(cnt, mx::int32), 1), 0);
+		to_eval.push_back(acc.fsums);
+		to_eval.push_back(acc.counts);
+	}
+	mx::eval(to_eval);
+}
+
+void GroupedGpuDownload(MlxGroupedState &state, GroupedGpuAcc &acc, const std::vector<MlxSumProgram> &programs) {
+	GroupedGpuFlushPartials(state, acc, programs);
+	mx::eval({acc.rows, acc.counts, acc.fsums});
+	auto rows_ptr = acc.rows.data<int32_t>();
+	auto counts_ptr = acc.counts.data<int32_t>();
+	auto fsums_ptr = acc.fsums.data<float>();
+	for (int64_t g = 0; g < acc.card; g++) {
+		state.rows[static_cast<size_t>(g)] += rows_ptr[g];
+		for (size_t p = 0; p < acc.nprogs; p++) {
+			auto slot = static_cast<size_t>(g) * acc.nprogs + p;
+			state.counts[slot] += counts_ptr[slot];
+			if (!programs[p].int_lane) {
+				state.fvalues[slot] += static_cast<double>(fsums_ptr[slot]);
+			}
+		}
+	}
+}
+
+MlxGroupedState MlxGroupedInitLike(const MlxGroupedState &state, const std::vector<MlxSumProgram> &programs);
+
+void GroupedAccumulateArrays(MlxGroupedState &state, const GroupedSegmentArrays &seg,
+                             const std::vector<MlxSumProgram> &programs) {
+	if (state.dense_reduce) {
+		GroupedDenseGpuReduce(state, seg, programs);
+		return;
+	}
+	if (state.gpu_handle >= 0) {
+		if (auto acc = GroupedGpuLookup(state.gpu_handle)) {
+			auto chunk_rows = GpuScatterChunkRows(programs);
+			if (chunk_rows >= seg.count) {
+				GroupedGpuScatter(*acc, seg, programs);
+				GroupedGpuFlushPartials(state, *acc, programs);
+			} else {
+				for (int64_t off = 0; off < seg.count; off += chunk_rows) {
+					auto end = std::min(off + chunk_rows, seg.count);
+					auto slice = SliceGroupedSegment(seg, off, end);
+					GroupedGpuScatter(*acc, slice, programs);
+					GroupedGpuFlushPartials(state, *acc, programs);
+				}
+			}
+			GroupedCpuScatterInt(state, seg, programs);
+		}
+		return;
+	}
+	auto n = seg.count;
+	if (n == 0) {
+		return;
+	}
+	auto card = state.card;
+	auto nprogs = programs.size();
+	auto codes = seg.codes.data<int32_t>();
+	std::vector<const float *> fexpr(nprogs, nullptr);
+	std::vector<const int64_t *> iexpr(nprogs, nullptr);
+	std::vector<const uint8_t *> pmask(nprogs, nullptr);
+	for (size_t p = 0; p < nprogs; p++) {
+		if (seg.exprs[p].has_value()) {
+			if (programs[p].int_lane) {
+				iexpr[p] = seg.exprs[p]->data<int64_t>();
+			} else {
+				fexpr[p] = seg.exprs[p]->data<float>();
+			}
+		}
+		if (seg.masks[p].has_value()) {
+			pmask[p] = seg.masks[p]->data<uint8_t>();
+		}
+	}
+
+	auto nthreads = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), 8));
+	std::vector<MlxGroupedState> locals(nthreads);
+	for (auto &local : locals) {
+		local = MlxGroupedInitLike(state, programs);
+	}
+	std::vector<const int32_t *> i32expr(nprogs, nullptr);
+	for (size_t p = 0; p < nprogs; p++) {
+		if (seg.exprs[p].has_value() && programs[p].int_lane && programs[p].int32_rows) {
+			i32expr[p] = seg.exprs[p]->data<int32_t>();
+			iexpr[p] = nullptr;
+		}
+	}
+	std::vector<std::thread> workers;
+	auto chunk = (static_cast<size_t>(n) + nthreads - 1) / nthreads;
+	for (size_t t = 0; t < nthreads; t++) {
+		auto lo = t * chunk;
+		auto hi = std::min<size_t>(lo + chunk, static_cast<size_t>(n));
+		if (lo >= hi) {
+			break;
+		}
+		workers.emplace_back([&, lo, hi, t]() {
+			auto &local = locals[t];
+			// group-existence rows (codes >= card land in a dump slot)
+			std::vector<int64_t> rows_dump(static_cast<size_t>(card) + 1, 0);
+			for (size_t i = lo; i < hi; i++) {
+				auto g = codes[i];
+				rows_dump[g < 0 || g > card ? card : g]++;
+			}
+			for (int64_t g = 0; g < card; g++) {
+				local.rows[g] += rows_dump[g];
+			}
+			// per-program streaming passes: sequential expr reads, one dump
+			// accumulator slot instead of a branch per row
+			for (size_t p = 0; p < nprogs; p++) {
+				auto kind = programs[p].kind;
+				if (kind == MlxAggKind::COUNT_STAR) {
+					continue;
+				}
+				auto mask = pmask[p];
+				if (kind == MlxAggKind::COUNT || !seg.exprs[p].has_value()) {
+					for (size_t i = lo; i < hi; i++) {
+						auto g = codes[i];
+						if (g < 0 || g >= card || (mask && !mask[i])) {
+							continue;
+						}
+						local.counts[static_cast<size_t>(g) * nprogs + p]++;
+					}
+					continue;
+				}
+				if (kind == MlxAggKind::SUM || kind == MlxAggKind::AVG) {
+					std::vector<__int128> isum(static_cast<size_t>(card) + 1, 0);
+					std::vector<double> fsum(programs[p].int_lane ? 0 : static_cast<size_t>(card) + 1, 0.0);
+					std::vector<int64_t> cnt(static_cast<size_t>(card) + 1, 0);
+					if (programs[p].int_lane && i32expr[p] && !mask) {
+						auto e = i32expr[p];
+						for (size_t i = lo; i < hi; i++) {
+							auto g = codes[i];
+							auto slot = (g < 0 || g > card) ? card : g;
+							isum[slot] += e[i];
+							cnt[slot]++;
+						}
+					} else if (programs[p].int_lane && iexpr[p] && !mask) {
+						auto e = iexpr[p];
+						for (size_t i = lo; i < hi; i++) {
+							auto g = codes[i];
+							auto slot = (g < 0 || g > card) ? card : g;
+							isum[slot] += e[i];
+							cnt[slot]++;
+						}
+					} else {
+						for (size_t i = lo; i < hi; i++) {
+							auto g = codes[i];
+							if (g < 0 || g >= card || (mask && !mask[i])) {
+								continue;
+							}
+							if (programs[p].int_lane) {
+								isum[g] += i32expr[p] ? static_cast<int64_t>(i32expr[p][i]) : iexpr[p][i];
+							} else {
+								fsum[g] += static_cast<double>(fexpr[p][i]);
+							}
+							cnt[g]++;
+						}
+					}
+					for (int64_t g = 0; g < card; g++) {
+						auto slot = static_cast<size_t>(g) * nprogs + p;
+						local.ivalues[slot] += isum[g];
+						if (!programs[p].int_lane) {
+							local.fvalues[slot] += fsum[g];
+						}
+						local.counts[slot] += cnt[g];
+					}
+					continue;
+				}
+				// MIN / MAX
+				for (size_t i = lo; i < hi; i++) {
+					auto g = codes[i];
+					if (g < 0 || g >= card || (mask && !mask[i])) {
+						continue;
+					}
+					auto slot = static_cast<size_t>(g) * nprogs + p;
+					local.counts[slot]++;
+					if (programs[p].int_lane) {
+						auto v = i32expr[p] ? static_cast<int64_t>(i32expr[p][i]) : iexpr[p][i];
+						if (kind == MlxAggKind::MIN) {
+							local.ivalues[slot] = std::min<__int128>(local.ivalues[slot], v);
+						} else {
+							local.ivalues[slot] = std::max<__int128>(local.ivalues[slot], v);
+						}
+					} else {
+						auto v = static_cast<double>(fexpr[p][i]);
+						if (kind == MlxAggKind::MIN) {
+							local.fvalues[slot] = std::min(local.fvalues[slot], v);
+						} else {
+							local.fvalues[slot] = std::max(local.fvalues[slot], v);
+						}
+					}
+				}
+			}
+		});
+	}
+	for (auto &w : workers) {
+		w.join();
+	}
+	for (auto &local : locals) {
+		for (int64_t g = 0; g < card; g++) {
+			state.rows[g] += local.rows[g];
+			for (size_t p = 0; p < nprogs; p++) {
+				auto slot = static_cast<size_t>(g) * nprogs + p;
+				state.counts[slot] += local.counts[slot];
+				switch (programs[p].kind) {
+				case MlxAggKind::MIN:
+					state.ivalues[slot] = std::min(state.ivalues[slot], local.ivalues[slot]);
+					state.fvalues[slot] = std::min(state.fvalues[slot], local.fvalues[slot]);
+					break;
+				case MlxAggKind::MAX:
+					state.ivalues[slot] = std::max(state.ivalues[slot], local.ivalues[slot]);
+					state.fvalues[slot] = std::max(state.fvalues[slot], local.fvalues[slot]);
+					break;
+				default:
+					state.ivalues[slot] += local.ivalues[slot];
+					state.fvalues[slot] += local.fvalues[slot];
+					break;
+				}
+			}
+		}
+	}
+}
+
+} // namespace
+
+MlxGroupedState MlxGroupedInit(const MlxGroupedSpec &spec, const std::vector<MlxSumProgram> &programs) {
+	MlxGroupedState state;
+	state.card = 1;
+	for (auto c : spec.key_cards) {
+		state.card *= c;
+	}
+	state.nprograms = programs.size();
+	auto slots = static_cast<size_t>(state.card) * state.nprograms;
+	state.fvalues.assign(slots, 0.0);
+	state.ivalues.assign(slots, 0);
+	state.counts.assign(slots, 0);
+	state.rows.assign(static_cast<size_t>(state.card), 0);
+	for (size_t p = 0; p < programs.size(); p++) {
+		for (int64_t g = 0; g < state.card; g++) {
+			auto slot = static_cast<size_t>(g) * state.nprograms + p;
+			if (programs[p].kind == MlxAggKind::MIN) {
+				state.fvalues[slot] = std::numeric_limits<double>::infinity();
+				state.ivalues[slot] = std::numeric_limits<int64_t>::max();
+			} else if (programs[p].kind == MlxAggKind::MAX) {
+				state.fvalues[slot] = -std::numeric_limits<double>::infinity();
+				state.ivalues[slot] = std::numeric_limits<int64_t>::min();
+			}
+		}
+	}
+	state.dense_reduce = state.card > 0 && state.card <= kDenseReduceCard;
+	state.gpu_handle = state.dense_reduce ? -1 : GroupedGpuOpen(state, programs);
+	return state;
+}
+
+void MlxGroupedGpuFinish(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs) {
+	if (state.gpu_handle < 0) {
+		return;
+	}
+	if (auto acc = GroupedGpuLookup(state.gpu_handle)) {
+		GroupedGpuDownload(state, *acc, programs);
+	}
+	GroupedGpuClose(state.gpu_handle);
+	state.gpu_handle = -1;
+}
+
+namespace {
+MlxGroupedState MlxGroupedInitLike(const MlxGroupedState &state, const std::vector<MlxSumProgram> &programs) {
+	MlxGroupedSpec spec;
+	spec.key_cards = {state.card};
+	spec.key_cols = {0};
+	spec.key_offsets = {0};
+	return MlxGroupedInit(spec, programs);
+}
+} // namespace
+
+void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, const std::vector<MlxColumnData> &cols,
+                          size_t count, const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	if (count == 0) {
+		return;
+	}
+	auto segment = SegmentFromHost(cols, count);
+	auto arrays = GroupedEvalSegment(segment, spec, programs, filter, state.dense_reduce);
+	GroupedAccumulateArrays(state, arrays, programs);
+}
+
+void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                const std::vector<std::string> &col_keys,
+                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	if (state.dense_reduce) {
+		MlxSegment mega;
+		{
+			std::lock_guard<std::mutex> guard(cache_mutex);
+			auto &store = CacheStore();
+			bool all_fused = true;
+			for (auto &key : col_keys) {
+				auto it = store.find(key);
+				if (it == store.end() || !it->second.fused_col.has_value()) {
+					all_fused = false;
+					break;
+				}
+			}
+			if (all_fused) {
+				mega.count = store[col_keys[0]].rows;
+				for (auto &key : col_keys) {
+					auto &cached = store[key];
+					mega.cols.push_back(*cached.fused_col);
+					if (cached.fused_valid.has_value()) {
+						mega.valids.push_back(*cached.fused_valid);
+					} else {
+						mega.valids.push_back(std::nullopt);
+					}
+				}
+			}
+		}
+		if (mega.count > 0 && !mega.cols.empty()) {
+			std::vector<mx::array> graph;
+			auto arrays = GroupedEvalSegment(mega, spec, programs, filter, true, true);
+			graph.push_back(arrays.codes);
+			for (auto &e : arrays.exprs) {
+				if (e.has_value()) {
+					graph.push_back(*e);
+				}
+			}
+			for (auto &m : arrays.masks) {
+				if (m.has_value()) {
+					graph.push_back(*m);
+				}
+			}
+			std::vector<mx::array> reduce_outs;
+			GroupedDenseGpuReduce(state, arrays, programs, true, &reduce_outs);
+			graph.insert(graph.end(), reduce_outs.begin(), reduce_outs.end());
+			mx::eval(graph);
+			GroupedDenseGpuReduceMerge(state, arrays, programs, reduce_outs);
+			return;
+		}
+	}
+
+	std::vector<MlxSegment> segments;
+	std::vector<std::vector<MlxZoneMap>> segment_zone_maps;
+	std::vector<SegmentPrunePred> prune_preds;
+	BuildSegmentPrunePreds(filter, prune_preds);
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		auto &store = CacheStore();
+		size_t nsegments = 0;
+		segment_zone_maps.resize(col_keys.size());
+		for (size_t c = 0; c < col_keys.size(); c++) {
+			auto &key = col_keys[c];
+			auto it = store.find(key);
+			if (it == store.end()) {
+				throw std::runtime_error("GPU cache miss for grouped column '" + key + "'");
+			}
+			segment_zone_maps[c] = it->second.zone_maps;
+			if (nsegments == 0) {
+				nsegments = it->second.segments.size();
+				segments.resize(nsegments);
+				for (size_t s = 0; s < nsegments; s++) {
+					segments[s].count = static_cast<int64_t>(it->second.segments[s].shape(0));
+				}
+			} else if (it->second.segments.size() != nsegments) {
+				throw std::runtime_error("GPU cache segment mismatch for grouped column '" + key + "'");
+			}
+			for (size_t s = 0; s < nsegments; s++) {
+				segments[s].cols.push_back(it->second.segments[s]);
+				segments[s].valids.push_back(it->second.valids[s]);
+			}
+		}
+	}
+	size_t seg_idx = 0;
+	if (state.dense_reduce) {
+		size_t batch_begin = 0;
+		int64_t batch_rows = 0;
+		auto flush_batch = [&]() {
+			if (batch_rows <= 0) {
+				return;
+			}
+			auto batch = ConcatSegmentParts(segments, batch_begin, seg_idx);
+			if (batch.count > 0) {
+				auto arrays = GroupedEvalSegment(batch, spec, programs, filter, true);
+				GroupedDenseGpuReduce(state, arrays, programs);
+			}
+			batch_begin = seg_idx;
+			batch_rows = 0;
+		};
+		for (size_t s = 0; s < segments.size(); s++, seg_idx++) {
+			auto &segment = segments[s];
+			if (segment.count > 0 && !SegmentShouldPrune(s, prune_preds, segment_zone_maps)) {
+				if (batch_rows == 0) {
+					batch_begin = s;
+				}
+				if (batch_rows > 0 && batch_rows + segment.count > kDenseCachedBatchRows) {
+					flush_batch();
+					batch_begin = s;
+				}
+				batch_rows += segment.count;
+			} else if (batch_rows > 0) {
+				flush_batch();
+			}
+		}
+		flush_batch();
+		return;
+	}
+	seg_idx = 0;
+	for (auto &segment : segments) {
+		if (segment.count > 0 && !SegmentShouldPrune(seg_idx, prune_preds, segment_zone_maps)) {
+			auto arrays = GroupedEvalSegment(segment, spec, programs, filter, false);
+			GroupedAccumulateArrays(state, arrays, programs);
+		}
+		seg_idx++;
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Dictionary encoding for VARCHAR group keys (cached as fp32 codes)
+//===--------------------------------------------------------------------===//
+
+namespace {
+struct MlxDictEntry {
+	int64_t population = -1;
+	std::vector<std::string> strings;
+	std::unordered_map<std::string, int32_t> index;
+};
+
+std::mutex &DictMutex() {
+	static std::mutex m;
+	return m;
+}
+
+std::unordered_map<std::string, MlxDictEntry> &DictStore() {
+	static std::unordered_map<std::string, MlxDictEntry> store;
+	return store;
+}
+} // namespace
+
+int32_t MlxDictEncode(const std::string &col_key, int64_t population, const std::string &value, int64_t max_card) {
+	std::lock_guard<std::mutex> guard(DictMutex());
+	auto &entry = DictStore()[col_key];
+	if (entry.population != population) {
+		entry.population = population;
+		entry.strings.clear();
+		entry.index.clear();
+	}
+	auto it = entry.index.find(value);
+	if (it != entry.index.end()) {
+		return it->second;
+	}
+	if (static_cast<int64_t>(entry.strings.size()) >= max_card) {
+		return -1;
+	}
+	auto code = static_cast<int32_t>(entry.strings.size());
+	entry.strings.push_back(value);
+	entry.index.emplace(value, code);
+	return code;
+}
+
+std::vector<std::string> MlxDictStrings(const std::string &col_key, int64_t population) {
+	std::lock_guard<std::mutex> guard(DictMutex());
+	auto it = DictStore().find(col_key);
+	if (it == DictStore().end() || it->second.population != population) {
+		return {};
+	}
+	return it->second.strings;
+}
+
+void MlxDictInstall(const std::string &col_key, int64_t population, std::vector<std::string> strings) {
+	std::lock_guard<std::mutex> guard(DictMutex());
+	auto &entry = DictStore()[col_key];
+	entry.population = population;
+	entry.index.clear();
+	for (size_t i = 0; i < strings.size(); i++) {
+		entry.index.emplace(strings[i], static_cast<int32_t>(i));
+	}
+	entry.strings = std::move(strings);
+}
+
+int64_t MlxDictCard(const std::string &col_key, int64_t population) {
+	std::lock_guard<std::mutex> guard(DictMutex());
+	auto it = DictStore().find(col_key);
+	if (it == DictStore().end() || it->second.population != population) {
+		return -1;
+	}
+	return static_cast<int64_t>(it->second.strings.size());
+}
+
+int64_t MlxCachePopulation(const std::string &col_key) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	auto it = CacheStore().find(col_key);
+	return it == CacheStore().end() ? -1 : it->second.population;
 }
 
 double MlxExprBenchInt64(const int64_t *data, size_t count) {

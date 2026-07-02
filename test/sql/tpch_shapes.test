@@ -43,7 +43,11 @@ true
 statement ok
 SET mlx_execution = true;
 
-# hot re-run from GPU cache
+# GQE-style: resident table must be pinned before filtered queries hit MLX_*_CACHED.
+statement ok
+SELECT sum(l_quantity + 0.0), avg(l_shipdate_ord), count(*) FROM lineitem_q6;
+
+# hot re-run from GPU cache (mask applies the Q6 filter over resident columns)
 query II
 EXPLAIN
 SELECT sum(l_quantity + 0.0)

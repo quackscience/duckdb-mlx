@@ -41,6 +41,10 @@ statement ok
 SET VARIABLE gpu_aggs = (SELECT [min(price)::VARCHAR, max(price)::VARCHAR, sum(qty)::VARCHAR,
                                  avg(price)::VARCHAR, count(qty)::VARCHAR] FROM td WHERE disc >= 0.05);
 
+# GQE-style: pin full-table columns before filtered queries use MLX_SUM_CACHED.
+statement ok
+SELECT sum(price * disc), sum(qty), min(price), count(ship) FROM td;
+
 # hot run serves from the cache
 query II
 EXPLAIN SELECT sum(price * disc), sum(qty), min(price) FROM td

@@ -115,6 +115,13 @@ struct MlxSumProgram {
 	std::vector<int32_t> null_cols;
 	//! Exact int64 evaluation (DECIMAL expressions); results land in ivalue
 	bool int_lane = false;
+	//! Row values provably fit int32 (eval + GPU scatter use int32; partials
+	//! merge to int128 after each scan segment)
+	bool int32_rows = false;
+	//! int-lane SUM/AVG via float32 GPU scatter when row |v| exceeds int32
+	bool gpu_fp32_rows = false;
+	//! Per-row |value| upper bound from column stats (scaled raw int lane)
+	double row_abs_bound = 0;
 	//! Multiplier the planner applies when rendering a DOUBLE result from a
 	//! raw-scaled int-lane value (e.g. avg(DECIMAL) => 10^-scale)
 	double render_scale = 1.0;
@@ -189,6 +196,9 @@ MlxPopulationPlan MlxCacheBeginPopulation(const std::string &table_prefix, const
 void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &col_keys,
                           const std::vector<bool> &store_col, const std::vector<MlxColumnData> &cols, size_t count);
 
+//! Fuse per-segment cache slices into contiguous GPU-resident columns (call after pin).
+void MlxCacheFuseTable(const std::string &table_prefix);
+
 //! Evaluates aggregate programs over cached columns, entirely GPU-resident.
 //! Partition-level zone maps prune segments before kernel launch when the WHERE
 //! clause is a conjunction of column-vs-constant comparisons.
@@ -226,6 +236,66 @@ void MlxGroupbyDenseAccumulateHost(const std::string &group_col_key, const std::
 //! Whether a cached GROUP BY over these columns is provably correct (dense
 //! table ready, or fp32-exact integer keys and no NULLs per zone maps).
 bool MlxGroupbyCachedSafe(const std::string &group_col_key, const std::string &value_col_key);
+
+// Generalized grouped aggregation (TPC-H Q1 class): dense combined key over
+// 1-2 key columns; the GPU evaluates codes, masks and expressions fused, then
+// scatter_add accumulates into dense tables (GQE-style groupby on Metal).
+
+struct MlxGroupedSpec {
+	std::vector<int32_t> key_cols;    // positions of key columns in `cols`
+	std::vector<int64_t> key_offsets; // subtracted per key before combining
+	std::vector<int64_t> key_cards;   // cardinality per key (product <= 65536)
+};
+
+//! Accumulation state: dense tables indexed [group * nprograms + program].
+//! Int-lane sums accumulate in 128-bit on the host after GPU scatter, so grouped
+//! decimal sums can never overflow (per-row values are bounded to int64 at plan time).
+struct MlxGroupedState {
+	int64_t card = 0;
+	size_t nprograms = 0;
+	std::vector<double> fvalues;
+	std::vector<__int128> ivalues;
+	std::vector<int64_t> counts;
+	std::vector<int64_t> rows; // filter-passing rows per group (group existence)
+	//! Per-group GPU reduce (low cardinality); avoids scatter atomics
+	bool dense_reduce = false;
+	//! >=0 while a GPU scatter accumulator is open for this state
+	int64_t gpu_handle = -1;
+};
+
+MlxGroupedState MlxGroupedInit(const MlxGroupedSpec &spec, const std::vector<MlxSumProgram> &programs);
+
+//! Accumulates one host segment.
+void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, const std::vector<MlxColumnData> &cols,
+                          size_t count, const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+
+//! Accumulates every cached segment of `col_keys` (order matches `cols`
+//! positions used by the programs and spec).
+void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                const std::vector<std::string> &col_keys,
+                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+
+//! Download GPU scatter accumulators into `state` and release GPU resources.
+void MlxGroupedGpuFinish(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs);
+
+// Dictionary encoding for VARCHAR group-key columns cached as fp32 codes.
+
+//! Returns the code for `value`, inserting it if new; -1 once `max_card` is
+//! exceeded (callers must abort caching then).
+int32_t MlxDictEncode(const std::string &col_key, int64_t population, const std::string &value, int64_t max_card);
+
+//! Decode table for the column's current population (empty if unknown).
+std::vector<std::string> MlxDictStrings(const std::string &col_key, int64_t population);
+
+//! Cardinality of the dictionary, or -1 when absent for this population.
+int64_t MlxDictCard(const std::string &col_key, int64_t population);
+
+//! Installs a complete decode table under a population (cold sinks build a
+//! local dictionary, then publish it alongside the cache population).
+void MlxDictInstall(const std::string &col_key, int64_t population, std::vector<std::string> strings);
+
+//! Population id of a cached column, or -1 when absent.
+int64_t MlxCachePopulation(const std::string &col_key);
 
 //! Group-by over GPU-resident cache columns; reads incremental dense table when available.
 std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key, const std::string &value_col_key);

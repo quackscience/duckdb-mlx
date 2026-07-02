@@ -1,50 +1,88 @@
-# TPC-H benchmark
+# TPC-H benchmark (GQE-aligned)
 
 ```shell
-python3 benchmark/tpch/run.py 1     # scale factor (1, 10, ...)
+python3 benchmark/tpch/run.py 10     # pins all 8 TPC-H tables, then 22 queries
+python3 benchmark/tpch/run.py 1      # SF1 (fast sanity check)
 ```
 
-One database file per scale factor (dbgen once, reused); one duckdb session per
-mode so the process-lifetime GPU cache can be hot; each query runs 1 cold + 5
-hot repetitions (GQE methodology). Two suites:
+Inside duckdb, GQE-style load:
 
-1. **Standard TPC-H 22 queries** (official `tpch_queries()` texts). TPC-H
-   columns are DECIMAL/DATE/VARCHAR, which the translator does not support yet,
-   so this suite measures **fallback parity and interception overhead**.
-2. **Supported shapes** on `lineitem` casted to DOUBLE/INTEGER
-   (`lineitem_dbl`), measuring **acceleration** on the shapes the extension
-   handles today.
+```sql
+LOAD duckdb_mlx;
+SELECT mlx_cache_pin_tpch();          -- all 8 tables
+-- or: SELECT mlx_cache_pin('lineitem');
+-- returns [rows, columns, already_resident]
+```
 
-## Results — SF10 (60M lineitem rows), base M4 24 GB, 2026-07-02 (rev 2)
+## Methodology (matches [NVIDIA GQE](https://github.com/rapidsai/gqe))
 
-With the exact DECIMAL int64 lane + DATE support and the int-lane cost gate:
+This harness mirrors the TPC-H workflow described in the GQE README and the
+[NVIDIA GQE blog post](https://developer.nvidia.com/blog/designing-gpu-accelerated-query-engines-with-nvidia-gqe/):
 
-Standard TPC-H: **1.12× total (1296.5 ms → 1161.0 ms)**, no query regresses.
-Lone decimal aggregates (Q6 class) deliberately decline — the CPU's pruned
-filtered scan beats emulated 64-bit GPU arithmetic there; multi-aggregate
-decimal shapes (Q1 class) intercept and run exactly (verified against the
-official Q6 answer to the cent before gating). Take single-query outliers
-(e.g. Q14) with salt: CPU baselines on this 24 GB box wobble.
+| GQE | duckdb-mlx equivalent |
+|---|---|
+| `load_tpch.py` — COPY all 8 tables into GPU memory once | `SELECT mlx_cache_pin_tpch();` (or per-table `mlx_cache_pin('lineitem')`) |
+| Tables resident until node manager exits | One duckdb process per mode; GPU column cache persists |
+| `run_tpch.py … all` — 22 standard queries | `tpch_queries()` — official DuckDB TPC-H texts |
+| 5 hot-cache repetitions per query (blog) | `--repeats 5` (default), after one warm-up pass |
+| Total wall time over all 22 queries | **total** row in output table |
+| DuckDB CPU baseline | `SET mlx_execution = false` |
 
-Supported shapes (hot, mean of 5, per-query cache isolation):
+**Not GQE-fair (dev only):** `--isolated` clears `mlx_cache_clear()` before each
+query. Use this to measure cold intercept paths, not to compare against GQE headline numbers.
 
-| query | CPU ms | GPU cold ms | GPU hot ms | speedup |
-|---|---|---|---|---|
-| S6 (Q6 shape: filtered sum, DOUBLE) | 46.0 | 734 | 36.0 | 1.28× |
-| S1 (Q1 shape: group-by sum) | 56.0 | 43 | 42.0 | 1.33× |
-| SA (multi-aggregate + filter) | 59.2 | 592 | 46.4 | 1.28× |
-| SE (expression-heavy sum) | 45.8 | 981 | 15.8 | **2.90×** |
-| **total** | **207.0** | | **140.2** | **1.48×** |
+**Supported-shape micro-suite:** `--shapes-only` runs the DOUBLE/INTEGER shapes
+the extension accelerates today (S6, S1, SA, SE).
+
+## Options
+
+```shell
+python3 benchmark/tpch/run.py 10 --repeats 5          # default
+python3 benchmark/tpch/run.py 10 --no-warmup        # skip warm-up (not GQE-fair)
+python3 benchmark/tpch/run.py 10 --isolated         # per-query cache clear (dev)
+python3 benchmark/tpch/run.py 10 --shapes-only      # micro-suite only
+```
+
+## Results — SF10 (60M lineitem rows), base M4 24 GB, 2026-07-02 (rev 3, GQE-aligned)
+
+**Methodology:** one warm-up pass of all 22 queries, then 5 timed hot repetitions
+per query, no `mlx_cache_clear()` between queries (matches GQE resident-table
+semantics). Reference: [rapidsai/gqe](https://github.com/rapidsai/gqe).
+
+| | CPU total | GPU total | speedup |
+|---|---|---|---|
+| **22 queries (SF10)** | **3434.8 ms** | **7071.8 ms** | **0.49×** |
+
+GPU wins on 17/22 queries individually (typical 1.2–1.9×), but **Q1 dominates**
+the total: 196 ms CPU vs **4559 ms GPU** (filtered GROUP BY on DECIMAL, cold
+scan every repetition because `table_filters` skip full-table cache pin). That
+single query accounts for the aggregate loss. Q6 with resident cache: 52 ms CPU
+vs 30 ms GPU (1.76×).
+
+Supported shapes (`--shapes-only`, isolated cache, DOUBLE/INTEGER casts):
+
+| query | CPU ms | GPU ms | speedup |
+|---|---|---|---|
+| S6 (Q6 shape: filtered sum) | 46.0 | 36.0 | 1.28× |
+| S1 (Q1 shape: group-by sum) | 56.0 | 42.0 | 1.33× |
+| SA (multi-aggregate + filter) | 59.2 | 46.4 | 1.28× |
+| SE (expression-heavy sum) | 45.8 | 15.8 | **2.90×** |
+| **total** | **207.0** | **140.2** | **1.48×** |
+
+Rev 2 (pre-GQE-alignment, per-query cache clear) showed 1.12× on standard TPC-H
+total — that mixed cold/hot semantics and is not comparable to GQE headline numbers.
 
 TPC disclaimer: non-audited, non-comparable results, for engineering guidance
-only.
+only. GQE headline numbers (SF1000, GB200) use different hardware and full GPU
+table residency via Parquet COPY; compare methodology, not absolute milliseconds.
 
 ## What the run taught us (fixed in-tree)
 
 - warm-path segmentation: one cache segment per 2048-row scan chunk meant
   thousands of GPU graphs per hot query (S6 was 3.0 s, now 28.8 ms)
 - never evaluate a filter mask eagerly to choose an execution path
-- reduce mask counts in int32 — Metal has no native 64-bit arithmetic
+- reduce mask counts in int32 — Metal has no native 64-bit scatter_add
+- GQE-fair runs must **not** clear the GPU cache between queries
 
 ## The unlock list (in impact order)
 

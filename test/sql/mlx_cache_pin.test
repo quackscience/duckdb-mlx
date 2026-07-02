@@ -1,0 +1,51 @@
+# name: test/sql/mlx_cache_pin.test
+# description: GQE-style resident table pin (mlx_cache_pin)
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+SELECT mlx_cache_clear();
+
+statement ok
+CREATE TABLE tp AS
+SELECT (range % 4)::BIGINT AS g,
+       (range * 3)::DOUBLE AS x,
+       (DATE '2020-01-01' + INTERVAL (range % 100) DAY)::DATE AS d
+FROM range(500000);
+
+statement ok
+SET mlx_min_rows = 1000;
+SET mlx_execution = true;
+
+# pin full table into GPU memory
+query I
+SELECT mlx_cache_pin('tp')[1:2] = [500000, 3];
+----
+true
+
+# filtered GROUP BY serves from MLX_GROUPBY_CACHED (mask only)
+query II
+EXPLAIN SELECT g, sum(x) FROM tp WHERE d <= DATE '2020-03-01' GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY_CACHED.*
+
+statement ok
+SET VARIABLE gpu = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tp WHERE d <= DATE '2020-03-01' GROUP BY g) q);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tp WHERE d <= DATE '2020-03-01' GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu') - getvariable('cpu')) / abs(getvariable('cpu')) < 1e-3;
+----
+true
+
+# idempotent re-pin
+query I
+SELECT mlx_cache_pin('tp')[3] = 1;
+----
+true

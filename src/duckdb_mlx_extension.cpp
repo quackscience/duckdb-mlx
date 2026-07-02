@@ -10,8 +10,8 @@
 
 #ifdef DUCKDB_MLX_GPU_ENABLED
 #include "mlx_bridge.hpp"
-#include "mlx_transparent.hpp"
 #endif
+#include "mlx_transparent.hpp"
 
 namespace duckdb {
 
@@ -161,6 +161,39 @@ static void MlxCacheClearFun(DataChunk &args, ExpressionState &state, Vector &re
 #endif
 }
 
+//! mlx_cache_pin(table) — GQE-style resident table: full scan into GPU column cache.
+static void MlxCachePinFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto table_name = args.data[0].GetValue(0).ToString();
+	auto pin = MlxCachePinTable(state.GetContext(), table_name);
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto list_data = ConstantVector::GetData<list_entry_t>(result);
+	list_data[0].offset = 0;
+	list_data[0].length = 3;
+	auto &child = ListVector::GetEntry(result);
+	child.SetVectorType(VectorType::FLAT_VECTOR);
+	auto child_data = FlatVector::GetData<int64_t>(child);
+	child_data[0] = pin.rows;
+	child_data[1] = pin.columns;
+	child_data[2] = pin.already_resident ? 1 : 0;
+	ListVector::SetListSize(result, 3);
+#else
+	throw NotImplementedException("mlx_cache_pin requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
+//! mlx_cache_pin_tpch() — pin all eight TPC-H tables (GQE load_tpch.py equivalent).
+static void MlxCachePinTpchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	MlxCachePinTpch(state.GetContext());
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto result_data = ConstantVector::GetData<string_t>(result);
+	result_data[0] = StringVector::AddString(result, "ok");
+#else
+	throw NotImplementedException("mlx_cache_pin_tpch requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
 //! mlx_groupby_bench(keys, values [, use_hash]) — GPU group-by sum spike; returns
 //! checksum of per-group sums for timing comparisons vs CPU.
 static void MlxGroupbyBenchFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -239,6 +272,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("mlx_cache_stats", {}, LogicalType::LIST(LogicalType::BIGINT),
 	                                       MlxCacheStatsFun));
 	loader.RegisterFunction(ScalarFunction("mlx_cache_clear", {}, LogicalType::VARCHAR, MlxCacheClearFun));
+	loader.RegisterFunction(ScalarFunction("mlx_cache_pin", {LogicalType::VARCHAR},
+	                                       LogicalType::LIST(LogicalType::BIGINT), MlxCachePinFun));
+	loader.RegisterFunction(ScalarFunction("mlx_cache_pin_tpch", {}, LogicalType::VARCHAR, MlxCachePinTpchFun));
 	loader.RegisterFunction(ScalarFunction("mlx_groupby_bench",
 	                                       {LogicalType::LIST(LogicalType::BIGINT),
 	                                        LogicalType::LIST(LogicalType::BIGINT)},

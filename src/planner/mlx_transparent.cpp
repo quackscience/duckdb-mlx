@@ -1,18 +1,10 @@
 #include "mlx_transparent.hpp"
 
 #include "duckdb.hpp"
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/storage_index.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -33,6 +25,14 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry_retriever.hpp"
+#include "duckdb/common/constants.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "mlx_bridge.hpp"
 #include "mlx_logger.hpp"
 
@@ -53,11 +53,16 @@ using duckdb_mlx::MlxSumProgram;
 // whole plan (fallback is sacred).
 //===--------------------------------------------------------------------===//
 struct MlxExprTranslator {
-	explicit MlxExprTranslator(LogicalGet &get, optional_ptr<LogicalProjection> proj) : get(get), proj(proj) {
+	MlxExprTranslator(LogicalGet &get, vector<LogicalProjection *> projs_p) : get(get), projs(std::move(projs_p)) {
+	}
+	MlxExprTranslator(LogicalGet &get, optional_ptr<LogicalProjection> proj) : get(get) {
+		if (proj) {
+			projs.push_back(proj.get());
+		}
 	}
 
 	LogicalGet &get;
-	optional_ptr<LogicalProjection> proj;
+	vector<LogicalProjection *> projs; // top-to-bottom chain below the aggregate
 	vector<MlxExprOp> ops;
 	std::set<int32_t> referenced_cols;
 
@@ -106,8 +111,10 @@ struct MlxExprTranslator {
 		switch (expr.GetExpressionClass()) {
 		case ExpressionClass::BOUND_COLUMN_REF: {
 			auto &colref = expr.Cast<BoundColumnRefExpression>();
-			if (proj && colref.binding.table_index == proj->table_index) {
-				return Translate(*proj->expressions[colref.binding.column_index], lane);
+			for (auto proj : projs) {
+				if (proj && colref.binding.table_index == proj->table_index) {
+					return Translate(*proj->expressions[colref.binding.column_index], lane);
+				}
 			}
 			if (colref.binding.table_index != get.table_index) {
 				return false;
@@ -418,103 +425,6 @@ static bool AppendLaneColumn(const LogicalType &type, UnifiedVectorFormat &fmt, 
 	}
 }
 
-//! After a filtered cold scan, warm the GPU cache from an unfiltered table read
-//! so a follow-up MLX_SUM_CACHED can apply cache_filter over full columns.
-static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_prefix, const vector<string> &col_keys,
-                                    int64_t expected_rows) {
-	if (col_keys.empty() || duckdb_mlx::MlxCacheHas(col_keys, expected_rows)) {
-		return;
-	}
-	auto hash_pos = table_prefix.rfind('#');
-	if (hash_pos == string::npos) {
-		return;
-	}
-	auto qualified = table_prefix.substr(0, hash_pos);
-	auto parts = StringUtil::Split(qualified, '.');
-	if (parts.size() != 3) {
-		return;
-	}
-	auto &catalog = Catalog::GetCatalog(context, parts[0]);
-	CatalogTransaction catalog_transaction(catalog, context);
-	auto &schema = catalog.GetSchema(context, parts[1]);
-	auto &table = schema.GetEntry(catalog_transaction, CatalogType::TABLE_ENTRY, parts[2])->Cast<TableCatalogEntry>();
-
-	vector<StorageIndex> storage_cols;
-	vector<LogicalType> types;
-	for (auto &key : col_keys) {
-		auto pos = key.rfind('#');
-		if (pos == string::npos) {
-			return;
-		}
-		auto storage_id = std::stoul(key.substr(pos + 1));
-		storage_cols.emplace_back(storage_id);
-		types.push_back(table.GetColumn(LogicalIndex(storage_id)).Type());
-	}
-
-	auto &data_table = table.GetStorage();
-	DuckTransaction &transaction = DuckTransaction::Get(context, table.catalog.GetAttached());
-	TableScanState scan_state;
-	data_table.InitializeScan(context, transaction, scan_state, storage_cols, nullptr);
-
-	auto plan = duckdb_mlx::MlxCacheBeginPopulation(table_prefix, col_keys, expected_rows);
-	DataChunk chunk;
-	chunk.Initialize(context, types);
-
-	// batch scan chunks into large segments — one segment per scan chunk
-	// would mean thousands of tiny GPU graphs per hot query
-	constexpr idx_t kWarmSegmentRows = 8 * 1024 * 1024;
-	vector<vector<float>> values(types.size());
-	vector<vector<int64_t>> ivalues(types.size());
-	vector<vector<uint8_t>> valid(types.size());
-	idx_t buffered = 0;
-
-	auto flush = [&]() {
-		if (buffered == 0) {
-			return;
-		}
-		vector<MlxColumnData> cols;
-		for (idx_t col = 0; col < values.size(); col++) {
-			MlxColumnData data;
-			data.valid = valid[col].empty() ? nullptr : valid[col].data();
-			if (!ivalues[col].empty()) {
-				data.ivalues = ivalues[col].data();
-			} else {
-				data.values = values[col].data();
-			}
-			cols.push_back(data);
-		}
-		duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, buffered);
-		for (idx_t col = 0; col < values.size(); col++) {
-			values[col].clear();
-			ivalues[col].clear();
-			valid[col].clear();
-		}
-		buffered = 0;
-	};
-
-	while (true) {
-		chunk.Reset();
-		data_table.Scan(transaction, chunk, scan_state);
-		auto count = chunk.size();
-		if (count == 0) {
-			break;
-		}
-		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
-			UnifiedVectorFormat fmt;
-			chunk.data[col].ToUnifiedFormat(count, fmt);
-			if (!AppendLaneColumn(chunk.data[col].GetType(), fmt, count, values[col], ivalues[col], valid[col])) {
-				return; // unsupported column type: leave the cache unwarmed
-			}
-		}
-		buffered += count;
-		if (buffered >= kWarmSegmentRows) {
-			flush();
-		}
-	}
-	flush();
-	duckdb_mlx::LogDebug("MLX_SUM warmed the GPU cache (unfiltered) for " + table_prefix);
-}
-
 //===--------------------------------------------------------------------===//
 // Physical operator: sinks child chunks into unified-memory column buffers,
 // evaluates all SUM programs in one GPU graph at Finalize, emits one row.
@@ -657,6 +567,7 @@ public:
 				SegmentColumns(segment, cols);
 				duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, row_count);
 			}
+			duckdb_mlx::MlxCacheFuseTable(table_prefix);
 			duckdb_mlx::MlxFilter no_filter;
 			gstate.results = duckdb_mlx::MlxSumExprsCached(col_keys, programs, no_filter);
 			duckdb_mlx::LogDebug("MLX_SUM populated the GPU cache for " + table_prefix);
@@ -714,9 +625,6 @@ public:
 				gstate.results[i].value = programs[i].int_lane ? static_cast<double>(gstate.results[i].ivalue) / count
 				                                               : gstate.results[i].value / count;
 			}
-		}
-		if (skip_cache_populate) {
-			WarmColumnCacheIfNeeded(context, table_prefix, col_keys, expected_rows);
 		}
 		return SinkFinalizeType::READY;
 	}
@@ -833,52 +741,76 @@ public:
 //===--------------------------------------------------------------------===//
 // GROUP BY: single integer key + single SUM(column) on GPU (hash or sort).
 //===--------------------------------------------------------------------===//
-struct MlxGroupbySegment {
-	vector<int64_t> keys;
-	vector<double> values;
+//===--------------------------------------------------------------------===//
+// Generalized grouped operator (TPC-H Q1 class): 1-2 dense keys (int ranges
+// or dictionary-encoded VARCHAR), any supported aggregate programs, exact
+// lanes. GPU evaluates codes/masks/expressions; host threads merge exactly.
+//===--------------------------------------------------------------------===//
+
+struct MlxGroupKeySpec {
+	int32_t scan_col = 0;   // chunk position after remap
+	LogicalType type;       // output type (compressed when materialization fired)
+	int64_t offset = 0;     // int keys: stats min (dense-code base)
+	int64_t emit_base = 0;  // added to the dense code when emitting the key
+	int64_t card = 0;       // plan-time estimate; refined at execution
+	bool is_varchar = false;
+	string cache_key;       // cache/dictionary identity
 };
 
-class MlxGroupbyLocalSinkState : public LocalSinkState {
-public:
-	MlxGroupbySegment segment;
-};
-
-class MlxGroupbyGlobalSinkState : public GlobalSinkState {
+class MlxGroupedGlobalSinkState : public GlobalSinkState {
 public:
 	mutex glock;
-	vector<MlxGroupbySegment> segments;
-	vector<duckdb_mlx::MlxGroupbyRow> results;
+	vector<MlxSumSegment> segments;
+	// local dictionary for VARCHAR keys (published at cache-populate time)
+	mutex dict_lock;
+	vector<vector<string>> dict_strings;                    // per key
+	vector<std::unordered_map<string, int32_t>> dict_index; // per key
+	duckdb_mlx::MlxGroupedState state;
+	bool state_ready = false;
 };
 
-class MlxGroupbyGlobalSourceState : public GlobalSourceState {
+class MlxGroupedLocalSinkState : public LocalSinkState {
+public:
+	MlxSumSegment segment;
+};
+
+class MlxGroupedGlobalSourceState : public GlobalSourceState {
 public:
 	idx_t offset = 0;
-	//! results for the cached (scan-less) mode, computed once per execution
-	vector<duckdb_mlx::MlxGroupbyRow> cached_rows;
-	bool cached_ready = false;
+	duckdb_mlx::MlxGroupedState state;
+	vector<vector<string>> dicts; // decode tables per key
+	vector<int64_t> cards;
+	bool ready = false;
 };
 
-class MlxGroupbyPhysicalOperator : public PhysicalOperator {
+class MlxGroupedPhysicalOperator : public PhysicalOperator {
 public:
-	MlxGroupbyPhysicalOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                           int32_t group_col_p, int32_t value_col_p, vector<string> col_keys_p,
-	                           string table_prefix_p, int64_t expected_rows_p, bool cached_p)
+	MlxGroupedPhysicalOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                           vector<MlxGroupKeySpec> keys_p, vector<MlxSumProgram> programs_p,
+	                           MlxFilter cache_filter_p, vector<string> col_keys_p, string table_prefix_p,
+	                           int64_t expected_rows_p, bool cached_p, bool skip_cache_populate_p,
+	                           vector<int32_t> output_map_p)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      group_col(group_col_p), value_col(value_col_p), col_keys(std::move(col_keys_p)),
-	      table_prefix(std::move(table_prefix_p)), expected_rows(expected_rows_p), cached(cached_p) {
+	      keys(std::move(keys_p)), programs(std::move(programs_p)), cache_filter(std::move(cache_filter_p)),
+	      col_keys(std::move(col_keys_p)), table_prefix(std::move(table_prefix_p)), expected_rows(expected_rows_p),
+	      cached(cached_p), skip_cache_populate(skip_cache_populate_p), output_map(std::move(output_map_p)) {
 	}
 
-	int32_t group_col;
-	int32_t value_col;
+	vector<MlxGroupKeySpec> keys;
+	vector<MlxSumProgram> programs;
+	MlxFilter cache_filter;
 	vector<string> col_keys;
 	string table_prefix;
 	int64_t expected_rows = 0;
 	bool cached;
+	bool skip_cache_populate;
+	//! output order: entry < nkeys => key, else program (nkeys + p). Mode B
+	//! (absorbed decompress projection) reorders outputs arbitrarily.
+	vector<int32_t> output_map;
 
 	string GetName() const override {
 		return cached ? "MLX_GROUPBY_CACHED" : "MLX_GROUPBY";
 	}
-
 	bool IsSink() const override {
 		return !cached;
 	}
@@ -890,115 +822,76 @@ public:
 	}
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
-		return make_uniq<MlxGroupbyLocalSinkState>();
+		return make_uniq<MlxGroupedLocalSinkState>();
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
-		return make_uniq<MlxGroupbyGlobalSinkState>();
+		auto state = make_uniq<MlxGroupedGlobalSinkState>();
+		state->dict_strings.resize(keys.size());
+		state->dict_index.resize(keys.size());
+		return std::move(state);
 	}
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
-		return make_uniq<MlxGroupbyGlobalSourceState>();
+		return make_uniq<MlxGroupedGlobalSourceState>();
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
-		auto &segment = input.local_state.Cast<MlxGroupbyLocalSinkState>().segment;
+		auto &segment = input.local_state.Cast<MlxGroupedLocalSinkState>().segment;
+		auto &gstate = input.global_state.Cast<MlxGroupedGlobalSinkState>();
+		if (segment.values.empty()) {
+			segment.values.resize(chunk.ColumnCount());
+			segment.ivalues.resize(chunk.ColumnCount());
+			segment.valid.resize(chunk.ColumnCount());
+		}
 		auto count = chunk.size();
-		auto base = segment.keys.size();
-		segment.keys.resize(base + count);
-		segment.values.resize(base + count);
-
-		UnifiedVectorFormat gfmt;
-		chunk.data[group_col].ToUnifiedFormat(count, gfmt);
-		UnifiedVectorFormat vfmt;
-		chunk.data[value_col].ToUnifiedFormat(count, vfmt);
-
-		switch (chunk.data[group_col].GetType().id()) {
-		case LogicalTypeId::BIGINT: {
-			auto gdata = UnifiedVectorFormat::GetData<int64_t>(gfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = gfmt.sel->get_index(i);
-				segment.keys[base + i] = gfmt.validity.RowIsValid(idx) ? gdata[idx] : INT64_MIN;
+		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+			// VARCHAR keys are dictionary-encoded into fp32 codes
+			int64_t key_idx = -1;
+			for (size_t k = 0; k < keys.size(); k++) {
+				if (keys[k].is_varchar && keys[k].scan_col == NumericCast<int32_t>(col)) {
+					key_idx = NumericCast<int64_t>(k);
+					break;
+				}
 			}
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			auto gdata = UnifiedVectorFormat::GetData<int32_t>(gfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = gfmt.sel->get_index(i);
-				segment.keys[base + i] = gfmt.validity.RowIsValid(idx) ? gdata[idx] : INT64_MIN;
+			UnifiedVectorFormat fmt;
+			chunk.data[col].ToUnifiedFormat(count, fmt);
+			if (key_idx >= 0) {
+				auto strings = UnifiedVectorFormat::GetData<string_t>(fmt);
+				auto &values = segment.values[col];
+				auto base = values.size();
+				values.resize(base + count);
+				lock_guard<mutex> guard(gstate.dict_lock);
+				auto &dict = gstate.dict_index[key_idx];
+				auto &decode = gstate.dict_strings[key_idx];
+				for (idx_t i = 0; i < count; i++) {
+					auto idx = fmt.sel->get_index(i);
+					if (!fmt.validity.RowIsValid(idx)) {
+						values[base + i] = -1.0f; // dumped by the code guard
+						continue;
+					}
+					auto str = strings[idx].GetString();
+					auto it = dict.find(str);
+					int32_t code;
+					if (it != dict.end()) {
+						code = it->second;
+					} else {
+						code = NumericCast<int32_t>(decode.size());
+						decode.push_back(str);
+						dict.emplace(str, code);
+					}
+					values[base + i] = static_cast<float>(code);
+				}
+			} else if (!AppendLaneColumn(chunk.data[col].GetType(), fmt, count, segment.values[col],
+			                             segment.ivalues[col], segment.valid[col])) {
+				throw InternalException("MLX_GROUPBY: unexpected column type at execution time");
 			}
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			auto gdata = UnifiedVectorFormat::GetData<uint8_t>(gfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = gfmt.sel->get_index(i);
-				segment.keys[base + i] = gfmt.validity.RowIsValid(idx) ? gdata[idx] : INT64_MIN;
-			}
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			auto gdata = UnifiedVectorFormat::GetData<uint16_t>(gfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = gfmt.sel->get_index(i);
-				segment.keys[base + i] = gfmt.validity.RowIsValid(idx) ? gdata[idx] : INT64_MIN;
-			}
-			break;
-		}
-		case LogicalTypeId::UINTEGER: {
-			auto gdata = UnifiedVectorFormat::GetData<uint32_t>(gfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = gfmt.sel->get_index(i);
-				segment.keys[base + i] = gfmt.validity.RowIsValid(idx) ? gdata[idx] : INT64_MIN;
-			}
-			break;
-		}
-		default:
-			throw InternalException("MLX_GROUPBY: unsupported group key type");
-		}
-
-		switch (chunk.data[value_col].GetType().id()) {
-		case LogicalTypeId::DOUBLE: {
-			auto vdata = UnifiedVectorFormat::GetData<double>(vfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? vdata[idx] : 0.0;
-			}
-			break;
-		}
-		case LogicalTypeId::FLOAT: {
-			auto vdata = UnifiedVectorFormat::GetData<float>(vfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
-			}
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			auto vdata = UnifiedVectorFormat::GetData<int64_t>(vfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
-			}
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			auto vdata = UnifiedVectorFormat::GetData<int32_t>(vfmt);
-			for (idx_t i = 0; i < count; i++) {
-				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
-			}
-			break;
-		}
-		default:
-			throw InternalException("MLX_GROUPBY: unsupported value type");
 		}
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
-		auto &lstate = input.local_state.Cast<MlxGroupbyLocalSinkState>();
-		auto &gstate = input.global_state.Cast<MlxGroupbyGlobalSinkState>();
-		if (lstate.segment.keys.empty()) {
+		auto &lstate = input.local_state.Cast<MlxGroupedLocalSinkState>();
+		auto &gstate = input.global_state.Cast<MlxGroupedGlobalSinkState>();
+		if (lstate.segment.values.empty()) {
 			return SinkCombineResultType::FINISHED;
 		}
 		lock_guard<mutex> guard(gstate.glock);
@@ -1006,128 +899,225 @@ public:
 		return SinkCombineResultType::FINISHED;
 	}
 
+	duckdb_mlx::MlxGroupedSpec BuildSpec(const vector<int64_t> &cards) const {
+		duckdb_mlx::MlxGroupedSpec spec;
+		for (size_t k = 0; k < keys.size(); k++) {
+			spec.key_cols.push_back(keys[k].scan_col);
+			spec.key_offsets.push_back(keys[k].is_varchar ? 0 : keys[k].offset);
+			spec.key_cards.push_back(cards[k]);
+		}
+		return spec;
+	}
+
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override {
-		auto &gstate = input.global_state.Cast<MlxGroupbyGlobalSinkState>();
-		if (col_keys.size() == 2) {
+		auto &gstate = input.global_state.Cast<MlxGroupedGlobalSinkState>();
+		// runtime-exact cards: dictionaries as built, int ranges from stats
+		vector<int64_t> cards;
+		for (size_t k = 0; k < keys.size(); k++) {
+			cards.push_back(keys[k].is_varchar
+			                    ? std::max<int64_t>(1, NumericCast<int64_t>(gstate.dict_strings[k].size()))
+			                    : keys[k].card);
+		}
+		auto spec = BuildSpec(cards);
+		duckdb_mlx::MlxFilter no_filter; // the cold scan already applied filters
+		gstate.state = duckdb_mlx::MlxGroupedInit(spec, programs);
+		for (auto &segment : gstate.segments) {
+			vector<MlxColumnData> cols;
+			size_t row_count = SegmentRowCount(segment);
+			SegmentColumns(segment, cols);
+			duckdb_mlx::MlxGroupedAccumulate(gstate.state, spec, cols, row_count, programs, no_filter);
+		}
+		duckdb_mlx::MlxGroupedGpuFinish(gstate.state, programs);
+		gstate.state_ready = true;
+
+		if (!col_keys.empty() && !skip_cache_populate) {
 			auto plan = duckdb_mlx::MlxCacheBeginPopulation(table_prefix, col_keys, expected_rows);
 			for (auto &segment : gstate.segments) {
-				vector<float> key_f(segment.keys.begin(), segment.keys.end());
-				vector<float> val_f(segment.values.begin(), segment.values.end());
-				vector<duckdb_mlx::MlxColumnData> cols = {{key_f.data(), nullptr}, {val_f.data(), nullptr}};
-				duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, key_f.size());
-				duckdb_mlx::MlxGroupbyDenseAccumulateHost(col_keys[0], col_keys[1], plan.population, key_f.data(),
-				                                          val_f.data(), key_f.size());
+				vector<MlxColumnData> cols;
+				size_t row_count = SegmentRowCount(segment);
+				SegmentColumns(segment, cols);
+				duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, row_count);
 			}
-			vector<int64_t> keys;
-			vector<double> values;
-			for (auto &segment : gstate.segments) {
-				keys.insert(keys.end(), segment.keys.begin(), segment.keys.end());
-				values.insert(values.end(), segment.values.begin(), segment.values.end());
+			duckdb_mlx::MlxCacheFuseTable(table_prefix);
+			for (size_t k = 0; k < keys.size(); k++) {
+				if (keys[k].is_varchar) {
+					duckdb_mlx::MlxDictInstall(keys[k].cache_key, plan.population, gstate.dict_strings[k]);
+				}
 			}
-			gstate.results = duckdb_mlx::MlxGroupbySum(keys.data(), values.data(), nullptr, keys.size(), false);
-			return SinkFinalizeType::READY;
+			duckdb_mlx::LogDebug("MLX_GROUPBY populated the GPU cache for " + table_prefix);
 		}
-		vector<int64_t> keys;
-		vector<double> values;
-		for (auto &segment : gstate.segments) {
-			keys.insert(keys.end(), segment.keys.begin(), segment.keys.end());
-			values.insert(values.end(), segment.values.begin(), segment.values.end());
-		}
-		gstate.results = duckdb_mlx::MlxGroupbySum(keys.data(), values.data(), nullptr, keys.size(), false);
 		return SinkFinalizeType::READY;
 	}
 
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
-		auto &source_state = input.global_state.Cast<MlxGroupbyGlobalSourceState>();
-		if (cached && !source_state.cached_ready) {
-			// pure source: never touches sink_state (there is none)
-			source_state.cached_rows = duckdb_mlx::MlxGroupbySumCached(col_keys[0], col_keys[1]);
-			source_state.cached_ready = true;
-		}
-		auto &results = cached ? source_state.cached_rows : sink_state->Cast<MlxGroupbyGlobalSinkState>().results;
-		if (types.size() != 2) {
-			throw InternalException("MLX_GROUPBY: operator types.size=" + std::to_string(types.size()));
-		}
-		if (results.empty() || source_state.offset >= results.size()) {
-			return SourceResultType::FINISHED;
-		}
-		auto remaining = results.size() - source_state.offset;
-		auto emit = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-		switch (chunk.data[0].GetType().id()) {
-		case LogicalTypeId::BIGINT: {
-			auto key_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-			for (idx_t i = 0; i < emit; i++) {
-				auto &row = results[source_state.offset + i];
-				key_data[i] = row.key;
+		auto &source = input.global_state.Cast<MlxGroupedGlobalSourceState>();
+		if (!source.ready) {
+			source.dicts.resize(keys.size());
+			if (cached) {
+				for (size_t k = 0; k < keys.size(); k++) {
+					if (keys[k].is_varchar) {
+						auto population = duckdb_mlx::MlxCachePopulation(keys[k].cache_key);
+						source.dicts[k] = duckdb_mlx::MlxDictStrings(keys[k].cache_key, population);
+						source.cards.push_back(std::max<int64_t>(1, NumericCast<int64_t>(source.dicts[k].size())));
+					} else {
+						source.cards.push_back(keys[k].card);
+					}
+				}
+				auto spec = BuildSpec(source.cards);
+				source.state = duckdb_mlx::MlxGroupedInit(spec, programs);
+				duckdb_mlx::MlxGroupedAccumulateCached(source.state, spec, col_keys, programs, cache_filter);
+				duckdb_mlx::MlxGroupedGpuFinish(source.state, programs);
+			} else {
+				auto &gstate = sink_state->Cast<MlxGroupedGlobalSinkState>();
+				source.state = gstate.state;
+				for (size_t k = 0; k < keys.size(); k++) {
+					source.dicts[k] = gstate.dict_strings[k];
+					source.cards.push_back(keys[k].is_varchar
+					                           ? std::max<int64_t>(1, NumericCast<int64_t>(source.dicts[k].size()))
+					                           : keys[k].card);
+				}
 			}
-			break;
+			source.ready = true;
 		}
-		case LogicalTypeId::INTEGER: {
-			auto key_data = FlatVector::GetData<int32_t>(chunk.data[0]);
-			for (idx_t i = 0; i < emit; i++) {
-				auto &row = results[source_state.offset + i];
-				key_data[i] = static_cast<int32_t>(row.key);
+
+		auto &state = source.state;
+		auto nkeys = keys.size();
+		auto nprogs = programs.size();
+		idx_t out = 0;
+		while (source.offset < static_cast<idx_t>(state.card) && out < STANDARD_VECTOR_SIZE) {
+			auto g = static_cast<int64_t>(source.offset++);
+			if (state.rows[g] == 0) {
+				continue;
 			}
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			auto key_data = FlatVector::GetData<uint8_t>(chunk.data[0]);
-			for (idx_t i = 0; i < emit; i++) {
-				auto &row = results[source_state.offset + i];
-				key_data[i] = static_cast<uint8_t>(row.key);
+			// decompose the combined code into per-key indexes
+			vector<int64_t> key_codes(nkeys);
+			auto rest = g;
+			for (size_t k = nkeys; k > 0; k--) {
+				key_codes[k - 1] = rest % source.cards[k - 1];
+				rest /= source.cards[k - 1];
 			}
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			auto key_data = FlatVector::GetData<uint16_t>(chunk.data[0]);
-			for (idx_t i = 0; i < emit; i++) {
-				auto &row = results[source_state.offset + i];
-				key_data[i] = static_cast<uint16_t>(row.key);
+			for (idx_t o = 0; o < output_map.size(); o++) {
+				auto &vec = chunk.data[o];
+				auto entry = output_map[o];
+				if (entry < NumericCast<int32_t>(nkeys)) {
+					auto k = static_cast<size_t>(entry);
+					if (keys[k].is_varchar) {
+						FlatVector::GetData<string_t>(vec)[out] =
+						    StringVector::AddString(vec, source.dicts[k][key_codes[k]]);
+					} else {
+						auto raw = key_codes[k] + keys[k].emit_base;
+						switch (vec.GetType().InternalType()) {
+						case PhysicalType::INT64:
+							FlatVector::GetData<int64_t>(vec)[out] = raw;
+							break;
+						case PhysicalType::INT32:
+							FlatVector::GetData<int32_t>(vec)[out] = NumericCast<int32_t>(raw);
+							break;
+						case PhysicalType::UINT32:
+							FlatVector::GetData<uint32_t>(vec)[out] = NumericCast<uint32_t>(raw);
+							break;
+						case PhysicalType::UINT16:
+							FlatVector::GetData<uint16_t>(vec)[out] = NumericCast<uint16_t>(raw);
+							break;
+						case PhysicalType::UINT8:
+							FlatVector::GetData<uint8_t>(vec)[out] = NumericCast<uint8_t>(raw);
+							break;
+						default:
+							throw InternalException("MLX_GROUPBY: unexpected key type");
+						}
+					}
+					continue;
+				}
+				auto p = static_cast<size_t>(entry) - nkeys;
+				auto slot = static_cast<size_t>(g) * nprogs + p;
+				auto count = state.counts[slot];
+				switch (programs[p].kind) {
+				case MlxAggKind::COUNT_STAR:
+					FlatVector::GetData<int64_t>(vec)[out] = state.rows[g];
+					break;
+				case MlxAggKind::COUNT:
+					FlatVector::GetData<int64_t>(vec)[out] = count;
+					break;
+				default:
+					if (count == 0) {
+						FlatVector::Validity(vec).SetInvalid(out);
+						break;
+					}
+					if (programs[p].int_lane && vec.GetType().id() == LogicalTypeId::DECIMAL) {
+						auto iv = state.ivalues[slot];
+						switch (vec.GetType().InternalType()) {
+						case PhysicalType::INT128: {
+							hugeint_t h;
+							h.lower = static_cast<uint64_t>(iv);
+							h.upper = static_cast<int64_t>(iv >> 64);
+							FlatVector::GetData<hugeint_t>(vec)[out] = h;
+							break;
+						}
+						case PhysicalType::INT64:
+							FlatVector::GetData<int64_t>(vec)[out] = static_cast<int64_t>(iv);
+							break;
+						case PhysicalType::INT32:
+							FlatVector::GetData<int32_t>(vec)[out] = static_cast<int32_t>(iv);
+							break;
+						default:
+							FlatVector::GetData<int16_t>(vec)[out] = static_cast<int16_t>(iv);
+							break;
+						}
+					} else {
+						double value = programs[p].int_lane ? static_cast<double>(state.ivalues[slot])
+						                                    : state.fvalues[slot];
+						if (programs[p].kind == MlxAggKind::AVG) {
+							value /= static_cast<double>(count);
+						}
+						FlatVector::GetData<double>(vec)[out] = value * programs[p].render_scale;
+					}
+					break;
+				}
 			}
-			break;
+			out++;
 		}
-		case LogicalTypeId::UINTEGER: {
-			auto key_data = FlatVector::GetData<uint32_t>(chunk.data[0]);
-			for (idx_t i = 0; i < emit; i++) {
-				auto &row = results[source_state.offset + i];
-				key_data[i] = static_cast<uint32_t>(row.key);
-			}
-			break;
-		}
-		default:
-			throw InternalException("MLX_GROUPBY: unsupported output group key type");
-		}
-		auto sum_data = FlatVector::GetData<double>(chunk.data[1]);
-		for (idx_t i = 0; i < emit; i++) {
-			sum_data[i] = results[source_state.offset + i].sum;
-		}
-		chunk.SetCardinality(emit);
-		source_state.offset += emit;
-		return SourceResultType::HAVE_MORE_OUTPUT;
+		chunk.SetCardinality(out);
+		return source.offset >= static_cast<idx_t>(state.card) && out == 0 ? SourceResultType::FINISHED
+		                                                                   : SourceResultType::HAVE_MORE_OUTPUT;
 	}
 };
 
-class MlxGroupbyLogicalOperator : public LogicalExtensionOperator {
+class MlxGroupedLogicalOperator : public LogicalExtensionOperator {
 public:
-	MlxGroupbyLogicalOperator(idx_t group_index_p, idx_t aggregate_index_p, int32_t group_col_p, int32_t value_col_p,
-	                          vector<LogicalType> output_types_p, vector<string> col_keys_p, string table_prefix_p,
-	                          int64_t expected_rows_p, bool cached_p)
-	    : group_index(group_index_p), aggregate_index(aggregate_index_p), group_col(group_col_p),
-	      value_col(value_col_p), output_types(std::move(output_types_p)), col_keys(std::move(col_keys_p)),
-	      table_prefix(std::move(table_prefix_p)), expected_rows(expected_rows_p), cached(cached_p) {
+	MlxGroupedLogicalOperator(idx_t group_index_p, idx_t aggregate_index_p, vector<MlxGroupKeySpec> keys_p,
+	                          vector<MlxSumProgram> programs_p, vector<LogicalType> agg_types_p,
+	                          MlxFilter cache_filter_p, vector<string> col_keys_p, string table_prefix_p,
+	                          int64_t expected_rows_p, bool cached_p, bool skip_cache_populate_p)
+	    : group_index(group_index_p), aggregate_index(aggregate_index_p), keys(std::move(keys_p)),
+	      programs(std::move(programs_p)), agg_types(std::move(agg_types_p)),
+	      cache_filter(std::move(cache_filter_p)), col_keys(std::move(col_keys_p)),
+	      table_prefix(std::move(table_prefix_p)), expected_rows(expected_rows_p), cached(cached_p),
+	      skip_cache_populate(skip_cache_populate_p) {
+		// natural order: keys then programs; mode B installs its own map
+		for (idx_t i = 0; i < keys.size() + programs.size(); i++) {
+			output_map.push_back(NumericCast<int32_t>(i));
+		}
 	}
 
 	idx_t group_index;
 	idx_t aggregate_index;
-	int32_t group_col;
-	int32_t value_col;
+	//! mode B: outputs bind to the absorbed parent projection's table index
+	//! in output_map order; otherwise two binding spaces (groups, aggregates)
+	bool single_binding = false;
+	idx_t output_index = 0;
+	vector<int32_t> output_map;
 	vector<LogicalType> output_types;
+	vector<MlxGroupKeySpec> keys;
+	vector<MlxSumProgram> programs;
+	vector<LogicalType> agg_types;
+	MlxFilter cache_filter;
 	vector<string> col_keys;
 	string table_prefix;
-	int64_t expected_rows = 0;
+	int64_t expected_rows;
 	bool cached;
+	bool skip_cache_populate;
 
 	string GetName() const override {
 		return cached ? "MLX_GROUPBY_CACHED" : "MLX_GROUPBY";
@@ -1137,16 +1127,39 @@ public:
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
-		return {{group_index, 0}, {aggregate_index, 0}};
+		vector<ColumnBinding> bindings;
+		if (single_binding) {
+			for (idx_t i = 0; i < output_map.size(); i++) {
+				bindings.emplace_back(output_index, i);
+			}
+			return bindings;
+		}
+		for (idx_t i = 0; i < keys.size(); i++) {
+			bindings.emplace_back(group_index, i);
+		}
+		for (idx_t i = 0; i < programs.size(); i++) {
+			bindings.emplace_back(aggregate_index, i);
+		}
+		return bindings;
 	}
 
 	void ResolveTypes() override {
-		types = output_types;
+		types.clear();
+		for (auto entry : output_map) {
+			if (entry < NumericCast<int32_t>(keys.size())) {
+				types.push_back(keys[entry].type);
+			} else {
+				types.push_back(agg_types[entry - NumericCast<int32_t>(keys.size())]);
+			}
+		}
 	}
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		auto &op = planner.Make<MlxGroupbyPhysicalOperator>(output_types, estimated_cardinality, group_col, value_col,
-		                                                    col_keys, table_prefix, expected_rows, cached);
+		auto &op = planner.Make<MlxGroupedPhysicalOperator>(types, estimated_cardinality, std::move(keys),
+		                                                    std::move(programs), std::move(cache_filter),
+		                                                    std::move(col_keys), std::move(table_prefix),
+		                                                    expected_rows, cached, skip_cache_populate,
+		                                                    std::move(output_map));
 		if (!cached) {
 			auto &child = planner.CreatePlan(*children[0]);
 			op.children.push_back(child);
@@ -1389,39 +1402,208 @@ static bool TranslateTableFilter(const TableFilter &table_filter, idx_t col_pos,
 	}
 }
 
+//! Shared aggregate-program acceptance for the ungrouped and grouped
+//! interceptors: translation, lanes, result typing and the int64
+//! overflow gate.
+static bool BuildAggregatePrograms(ClientContext &context, optional_ptr<LogicalGet> get,
+                                   const vector<LogicalProjection *> &projs, LogicalAggregate &agg,
+                                   idx_t estimated_rows, bool host_accumulated, vector<MlxSumProgram> &programs,
+                                   vector<LogicalType> &agg_types) {
+	// interval bound of |program| per row from column statistics; declines
+	// int-lane sums whose exact int64 accumulation could overflow
+	auto program_abs_bound = [&](const MlxSumProgram &program, double &bound) {
+		std::vector<double> stack;
+		for (auto &op : program.ops) {
+			switch (op.code) {
+			case MlxExprOpCode::LOAD_COL: {
+				unique_ptr<BaseStatistics> stats;
+				if (get->function.statistics_extended) {
+					auto &column_ids = get->GetColumnIds();
+					idx_t pos = column_ids.size();
+					for (idx_t i = 0; i < column_ids.size(); i++) {
+						if (column_ids[i].GetPrimaryIndex() == static_cast<idx_t>(op.col)) {
+							pos = i;
+							break;
+						}
+					}
+					if (pos < column_ids.size()) {
+						TableFunctionGetStatisticsInput input(get->bind_data.get(), column_ids[pos]);
+						stats = get->function.statistics_extended(context, input);
+					}
+				}
+				if (!stats || !NumericStats::HasMinMax(*stats)) {
+					{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+				}
+				auto lo = NumericStats::Min(*stats).GetValue<double>();
+				auto hi = NumericStats::Max(*stats).GetValue<double>();
+				double raw_scale = 1.0;
+				auto &col_type = get->returned_types[op.col];
+				if (col_type.id() == LogicalTypeId::DECIMAL) {
+					raw_scale = static_cast<double>(MlxExprTranslator::Pow10(DecimalType::GetScale(col_type)));
+				}
+				stack.push_back(std::max(std::abs(lo), std::abs(hi)) * raw_scale);
+				break;
+			}
+			case MlxExprOpCode::CONST_VAL:
+				stack.push_back(op.int_lane ? std::abs(static_cast<double>(op.ivalue)) : std::abs(op.value));
+				break;
+			case MlxExprOpCode::ADD:
+			case MlxExprOpCode::SUB: {
+				auto b = stack.back();
+				stack.pop_back();
+				stack.back() += b;
+				break;
+			}
+			case MlxExprOpCode::MUL: {
+				auto b = stack.back();
+				stack.pop_back();
+				stack.back() *= b;
+				break;
+			}
+			case MlxExprOpCode::NEGATE:
+			case MlxExprOpCode::ABS:
+				break;
+			default:
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+		}
+		bound = stack.empty() ? 0.0 : stack.back();
+		return true;
+	};
+
+	programs.clear();
+	agg_types.clear();
+	for (auto &expr : agg.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+		}
+		auto &aggr = expr->Cast<BoundAggregateExpression>();
+		if (aggr.IsDistinct() || aggr.filter) {
+			{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+		}
+		MlxSumProgram program;
+		auto &name = aggr.function.name;
+		if (name == "count_star" && aggr.children.empty()) {
+			program.kind = MlxAggKind::COUNT_STAR;
+		} else if (name == "count" && aggr.children.size() == 1) {
+			program.kind = MlxAggKind::COUNT;
+		} else if (aggr.children.size() == 1) {
+			if (name == "sum" || name == "sum_no_overflow") {
+				program.kind = MlxAggKind::SUM;
+			} else if (name == "avg") {
+				program.kind = MlxAggKind::AVG;
+			} else if (name == "min") {
+				program.kind = MlxAggKind::MIN;
+			} else if (name == "max") {
+				program.kind = MlxAggKind::MAX;
+			} else {
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+		} else {
+			{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+		}
+		if (!aggr.children.empty()) {
+			MlxExprTranslator translator(*get, projs);
+			MlxExprTranslator::Lane lane;
+			if (!translator.Translate(*aggr.children[0], lane) || lane == MlxExprTranslator::Lane::BOOL_LANE) {
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+			program.int_lane = lane == MlxExprTranslator::Lane::INT_LANE;
+			program.ops = std::move(translator.ops);
+			program.null_cols.assign(translator.referenced_cols.begin(), translator.referenced_cols.end());
+		}
+
+		// result typing: exact DECIMAL results ride the int lane
+		if (program.kind == MlxAggKind::COUNT || program.kind == MlxAggKind::COUNT_STAR) {
+			if (aggr.return_type.id() != LogicalTypeId::BIGINT) {
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+			agg_types.push_back(LogicalType::BIGINT);
+		} else if (program.int_lane) {
+			auto &child_type = aggr.children[0]->return_type;
+			if (child_type.id() != LogicalTypeId::DECIMAL) {
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+			auto child_scale = DecimalType::GetScale(child_type);
+			switch (program.kind) {
+			case MlxAggKind::SUM:
+				if (aggr.return_type.id() != LogicalTypeId::DECIMAL ||
+				    DecimalType::GetScale(aggr.return_type) != child_scale) {
+					{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+				}
+				agg_types.push_back(aggr.return_type);
+				break;
+			case MlxAggKind::AVG:
+				if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
+					{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+				}
+				program.render_scale = 1.0 / static_cast<double>(MlxExprTranslator::Pow10(child_scale));
+				agg_types.push_back(LogicalType::DOUBLE);
+				break;
+			default: // MIN / MAX keep the child's decimal type
+				if (aggr.return_type != child_type) {
+					{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+				}
+				agg_types.push_back(aggr.return_type);
+				break;
+			}
+			if (program.kind == MlxAggKind::SUM || program.kind == MlxAggKind::AVG) {
+				double bound = 0;
+				if (!program_abs_bound(program, bound) ||
+				    bound * static_cast<double>(std::max<idx_t>(estimated_rows, 1)) >= std::ldexp(1.0, 61)) {
+					{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; } // exact int64 accumulation could overflow
+				}
+				// Metal scatter supports int32/float32 only — route int-lane SUM/AVG to
+				// GPU with chunked partial merge into int128 host accumulators.
+				program.row_abs_bound = bound;
+				constexpr double kInt32Max = static_cast<double>(std::numeric_limits<int32_t>::max());
+				if (bound <= kInt32Max) {
+					program.int32_rows = true;
+				} else {
+					program.gpu_fp32_rows = true;
+				}
+			}
+		} else {
+			if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
+				{ duckdb_mlx::LogDebug("MLX_AGGPROG decline @" + std::to_string(__LINE__)); return false; }
+			}
+			agg_types.push_back(LogicalType::DOUBLE);
+		}
+		programs.push_back(std::move(program));
+	}
+	return true;
+}
+
 static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperator> &plan, idx_t min_rows) {
-	if (plan->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+	// mode B: a decompress projection directly above the aggregate is
+	// absorbed, so string-compressed group keys can be emitted as raw
+	// dictionary strings
+	optional_ptr<LogicalProjection> parent_proj;
+	LogicalOperator *agg_node = plan.get();
+	if (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
+	    plan->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		parent_proj = &plan->Cast<LogicalProjection>();
+		agg_node = plan->children[0].get();
+	}
+	if (agg_node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return false;
 	}
-	auto &agg = plan->Cast<LogicalAggregate>();
-	if (agg.groups.size() != 1) {
+	auto &agg = agg_node->Cast<LogicalAggregate>();
+	if (agg.groups.empty() || agg.groups.size() > 2 || agg.expressions.empty()) {
 		return false;
 	}
-	if (agg.grouping_sets.size() > 1) {
-		return false;
-	}
-	if (!agg.grouping_sets.empty() && agg.grouping_sets[0].size() != 1) {
-		return false;
-	}
-	if (agg.expressions.size() != 1) {
-		return false;
-	}
-	if (agg.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
-		return false;
-	}
-	auto &aggr = agg.expressions[0]->Cast<BoundAggregateExpression>();
-	if (aggr.function.name != "sum" || aggr.IsDistinct() || aggr.filter || aggr.children.size() != 1) {
+	if (agg.grouping_sets.size() > 1 ||
+	    (!agg.grouping_sets.empty() && agg.grouping_sets[0].size() != agg.groups.size())) {
 		return false;
 	}
 
-	optional_ptr<LogicalProjection> child_proj;
-	if (agg.children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		child_proj = &agg.children[0]->Cast<LogicalProjection>();
-	}
+	// walk the projection chain below the aggregate
+	vector<LogicalProjection *> projs;
 	optional_ptr<LogicalFilter> filter_op;
 	optional_ptr<LogicalGet> get;
 	reference<LogicalOperator> node = *agg.children[0];
-	while (node.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+	while (node.get().type == LogicalOperatorType::LOGICAL_PROJECTION && projs.size() < 3) {
+		projs.push_back(&node.get().Cast<LogicalProjection>());
 		node = *node.get().children[0];
 	}
 	if (node.get().type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -1443,103 +1625,291 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 	if (estimated_rows < min_rows) {
 		return false;
 	}
+	auto &column_ids = get->GetColumnIds();
 
-	auto map_col = [&](const BoundColumnRefExpression &colref) -> int32_t {
-		const BoundColumnRefExpression *cref = &colref;
-		if (cref->binding.table_index == agg.group_index) {
-			if (agg.groups[cref->binding.column_index]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-				cref = &agg.groups[cref->binding.column_index]->Cast<BoundColumnRefExpression>();
+	auto column_stats = [&](idx_t storage_col) -> unique_ptr<BaseStatistics> {
+		if (!get->function.statistics_extended) {
+			return nullptr;
+		}
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i].GetPrimaryIndex() == storage_col) {
+				TableFunctionGetStatisticsInput input(get->bind_data.get(), column_ids[i]);
+				return get->function.statistics_extended(context, input);
 			}
 		}
-		if (child_proj && cref->binding.table_index == child_proj->table_index) {
-			auto &pexpr = child_proj->expressions[cref->binding.column_index];
-			if (pexpr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-				return -1;
-			}
-			cref = &pexpr->Cast<BoundColumnRefExpression>();
-		}
-		if (cref->binding.table_index != get->table_index) {
-			return -1;
-		}
-		auto col_idx = cref->binding.column_index;
-		if (get->projection_ids.empty()) {
-			return NumericCast<int32_t>(col_idx);
-		}
-		for (idx_t out = 0; out < get->projection_ids.size(); out++) {
-			if (get->projection_ids[out] == col_idx) {
-				return NumericCast<int32_t>(out);
-			}
-		}
-		return -1;
+		return nullptr;
 	};
 
-	auto resolve_output_idx = [&](const Expression &expr) -> int32_t {
-		switch (expr.GetExpressionClass()) {
-		case ExpressionClass::BOUND_COLUMN_REF: {
-			auto &cref = expr.Cast<BoundColumnRefExpression>();
-			if (child_proj && cref.binding.table_index == child_proj->table_index) {
-				return NumericCast<int32_t>(cref.binding.column_index);
+	// group keys: resolve each through the projection chain, unwrapping
+	// CompressedMaterialization wrappers (integral: emit compressed values;
+	// string: dictionary-encode the raw column and absorb the decompress
+	// parent). Keys must be provably NULL-free.
+	vector<MlxGroupKeySpec> keys;
+	std::set<int32_t> key_storage_cols;
+	int64_t combined_card = 1;
+	bool any_string_compressed = false;
+	for (auto &group : agg.groups) {
+		const Expression *cur = group.get();
+		int64_t compress_offset = 0;
+		bool string_compressed = false;
+		LogicalType output_type;
+		bool output_type_set = false;
+		while (true) {
+			if (cur->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+				auto &cref = cur->Cast<BoundColumnRefExpression>();
+				LogicalProjection *owner = nullptr;
+				for (auto proj : projs) {
+					if (cref.binding.table_index == proj->table_index) {
+						owner = proj;
+						break;
+					}
+				}
+				if (!owner) {
+					break; // base column (or unknown -> checked below)
+				}
+				cur = owner->expressions[cref.binding.column_index].get();
+				continue;
 			}
-			return map_col(cref);
+			if (cur->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				auto &fn = cur->Cast<BoundFunctionExpression>();
+				if (StringUtil::StartsWith(fn.function.name, "__internal_compress_integral_") &&
+				    fn.children.size() == 2 &&
+				    fn.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+					compress_offset =
+					    fn.children[1]->Cast<BoundConstantExpression>().value.GetValue<int64_t>();
+					if (!output_type_set) {
+						output_type = fn.return_type;
+						output_type_set = true;
+					}
+					cur = fn.children[0].get();
+					continue;
+				}
+				if (StringUtil::StartsWith(fn.function.name, "__internal_compress_string_") &&
+				    fn.children.size() == 1) {
+					string_compressed = true;
+					cur = fn.children[0].get();
+					continue;
+				}
+				return false;
+			}
+			return false;
 		}
-		case ExpressionClass::BOUND_REF:
-			return NumericCast<int32_t>(expr.Cast<BoundReferenceExpression>().index);
+		if (cur->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &cref = cur->Cast<BoundColumnRefExpression>();
+		if (cref.binding.table_index != get->table_index || cref.binding.column_index >= column_ids.size()) {
+			return false;
+		}
+		if (string_compressed) {
+			if (!parent_proj) {
+				return false; // the decompress parent must be absorbed
+			}
+			any_string_compressed = true;
+		}
+		auto storage_col = column_ids[cref.binding.column_index].GetPrimaryIndex();
+		auto stats = column_stats(storage_col);
+		if (!stats || stats->CanHaveNull()) {
+			return false;
+		}
+		MlxGroupKeySpec key;
+		key.scan_col = NumericCast<int32_t>(storage_col); // remapped below
+		key.type = output_type_set ? output_type : cref.return_type;
+		switch (cref.return_type.id()) {
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER: {
+			if (!NumericStats::HasMinMax(*stats)) {
+				return false;
+			}
+			auto lo = NumericStats::Min(*stats).GetValue<int64_t>();
+			auto hi = NumericStats::Max(*stats).GetValue<int64_t>();
+			if (hi < lo || hi - lo + 1 > 65536) {
+				return false;
+			}
+			key.offset = lo;
+			key.emit_base = lo - compress_offset;
+			key.card = hi - lo + 1;
+			break;
+		}
+		case LogicalTypeId::VARCHAR: {
+			auto distinct = stats->GetDistinctCount();
+			if (distinct == 0 || distinct > 4096) {
+				return false;
+			}
+			key.is_varchar = true;
+			key.type = LogicalType::VARCHAR; // raw strings (decompress absorbed)
+			key.card = NumericCast<int64_t>(distinct);
+			break;
+		}
 		default:
-			return -1;
+			return false;
 		}
-	};
-
-	auto group_col = resolve_output_idx(*agg.groups[0]);
-	auto value_col = resolve_output_idx(*aggr.children[0]);
-	if (group_col < 0 || value_col < 0) {
+		combined_card *= key.card;
+		if (combined_card > 65536) {
+			return false;
+		}
+		key_storage_cols.insert(NumericCast<int32_t>(storage_col));
+		keys.push_back(std::move(key));
+	}
+	// mode B is only engaged for string-compressed keys; otherwise intercept
+	// at the aggregate node itself (the parent projection stays)
+	if (parent_proj && !any_string_compressed) {
 		return false;
 	}
 
-	// NULL group keys / values have SQL semantics (NULL group, NULL-skipping
-	// sums) the sink's sentinel encoding does not implement — decline unless
-	// statistics prove both columns NULL-free
-	auto column_may_be_null = [&](int32_t scan_col) {
-		idx_t storage_idx = static_cast<idx_t>(scan_col);
-		if (!get->projection_ids.empty()) {
-			if (static_cast<size_t>(scan_col) >= get->projection_ids.size()) {
-				return true;
+	// mode B: map the parent projection's outputs onto our keys/programs
+	vector<int32_t> output_map;
+	if (parent_proj) {
+		for (auto &pexpr : parent_proj->expressions) {
+			const Expression *e = pexpr.get();
+			if (e->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				auto &fn = e->Cast<BoundFunctionExpression>();
+				if (!StringUtil::StartsWith(fn.function.name, "__internal_decompress_string") ||
+				    fn.children.empty()) {
+					return false;
+				}
+				e = fn.children[0].get();
 			}
-			storage_idx = get->projection_ids[scan_col];
+			if (e->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return false;
+			}
+			auto &cref = e->Cast<BoundColumnRefExpression>();
+			if (cref.binding.table_index == agg.group_index) {
+				if (cref.binding.column_index >= keys.size()) {
+					return false;
+				}
+				output_map.push_back(NumericCast<int32_t>(cref.binding.column_index));
+			} else if (cref.binding.table_index == agg.aggregate_index) {
+				if (cref.binding.column_index >= agg.expressions.size()) {
+					return false;
+				}
+				output_map.push_back(NumericCast<int32_t>(keys.size() + cref.binding.column_index));
+			} else {
+				return false;
+			}
 		}
-		if (storage_idx >= get->GetColumnIds().size()) {
-			return true;
+	}
+
+	// WHERE predicate (Sirius-style: cold scan applies it; GPU mask on cached)
+	MlxFilter cache_filter;
+	std::set<int32_t> filter_cols;
+	if (filter_op) {
+		bool first = true;
+		for (auto &expr : filter_op->expressions) {
+			MlxExprTranslator translator(*get, vector<LogicalProjection *> {});
+			MlxExprTranslator::Lane expr_lane;
+			if (!translator.Translate(*expr, expr_lane) || expr_lane != MlxExprTranslator::Lane::BOOL_LANE) {
+				return false;
+			}
+			cache_filter.ops.insert(cache_filter.ops.end(), translator.ops.begin(), translator.ops.end());
+			filter_cols.insert(translator.referenced_cols.begin(), translator.referenced_cols.end());
+			if (!first) {
+				cache_filter.ops.push_back({MlxExprOpCode::AND, 0, 0});
+			}
+			first = false;
 		}
-		unique_ptr<BaseStatistics> stats;
-		if (get->function.statistics_extended) {
-			TableFunctionGetStatisticsInput input(get->bind_data.get(), get->GetColumnIds()[storage_idx]);
-			stats = get->function.statistics_extended(context, input);
-		} else if (get->function.statistics) {
-			stats = get->function.statistics(context, get->bind_data.get(),
-			                                 get->GetColumnIds()[storage_idx].GetPrimaryIndex());
+	}
+	for (auto &entry : get->table_filters.filters) {
+		idx_t col_pos = column_ids.size();
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i].GetPrimaryIndex() == entry.first) {
+				col_pos = i;
+				break;
+			}
 		}
-		return !stats || stats->CanHaveNull();
+		if (col_pos == column_ids.size()) {
+			return false;
+		}
+		vector<MlxExprOp> ops;
+		if (!TranslateTableFilter(*entry.second, col_pos, entry.first, *get, ops, filter_cols)) {
+			return false;
+		}
+		if (!ops.empty()) {
+			bool had_ops = !cache_filter.ops.empty();
+			cache_filter.ops.insert(cache_filter.ops.end(), ops.begin(), ops.end());
+			if (had_ops) {
+				cache_filter.ops.push_back({MlxExprOpCode::AND, 0, 0});
+			}
+		}
+	}
+	cache_filter.null_cols.assign(filter_cols.begin(), filter_cols.end());
+
+	// aggregate programs (shared acceptance; grouped sums accumulate host-side
+	// in 128-bit, so only per-row int64 bounds apply)
+	vector<MlxSumProgram> programs;
+	vector<LogicalType> agg_types;
+	if (!BuildAggregatePrograms(context, get, projs, agg, estimated_rows, true, programs, agg_types)) {
+		return false;
+	}
+
+	// scan projection: program columns + key columns; cache adds filter cols
+	std::set<idx_t> agg_column_ids;
+	CollectProgramColumnIds(programs, *get, agg_column_ids);
+	auto storage_to_column_ids_idx = [&](idx_t storage_col) -> idx_t {
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i].GetPrimaryIndex() == storage_col) {
+				return i;
+			}
+		}
+		return column_ids.size();
 	};
-	if (column_may_be_null(group_col) || column_may_be_null(value_col)) {
-		return false;
+	for (auto storage_col : key_storage_cols) {
+		auto pos = storage_to_column_ids_idx(NumericCast<idx_t>(storage_col));
+		if (pos >= column_ids.size()) {
+			return false;
+		}
+		agg_column_ids.insert(pos);
 	}
-	LogicalType group_type;
-	if (child_proj && group_col >= 0 && static_cast<size_t>(group_col) < child_proj->expressions.size()) {
-		group_type = child_proj->expressions[group_col]->return_type;
+
+	vector<idx_t> scan_projection;
+	if (get->projection_ids.empty()) {
+		scan_projection.assign(agg_column_ids.begin(), agg_column_ids.end());
 	} else {
-		group_type = agg.groups[0]->return_type;
+		std::set<idx_t> projection_set(get->projection_ids.begin(), get->projection_ids.end());
+		for (auto column_ids_idx : agg_column_ids) {
+			projection_set.insert(column_ids_idx);
+		}
+		scan_projection.assign(projection_set.begin(), projection_set.end());
 	}
-	if (group_type.id() != LogicalTypeId::BIGINT && group_type.id() != LogicalTypeId::INTEGER &&
-	    group_type.id() != LogicalTypeId::UTINYINT && group_type.id() != LogicalTypeId::USMALLINT &&
-	    group_type.id() != LogicalTypeId::UINTEGER) {
-		return false;
-	}
-	if (!MlxExprTranslator::IsSupportedColumnType(aggr.children[0]->return_type)) {
-		return false;
+	vector<idx_t> cache_projection(scan_projection.begin(), scan_projection.end());
+	for (auto storage_col : filter_cols) {
+		auto column_ids_idx = storage_to_column_ids_idx(static_cast<idx_t>(storage_col));
+		if (column_ids_idx >= column_ids.size()) {
+			return false;
+		}
+		if (std::find(cache_projection.begin(), cache_projection.end(), column_ids_idx) == cache_projection.end()) {
+			cache_projection.push_back(column_ids_idx);
+		}
 	}
 
-	bool has_filter = filter_op != nullptr || !get->table_filters.filters.empty();
+	if (!RemapStorageToChunk(cache_filter.ops, cache_filter.null_cols, cache_projection, *get)) {
+		return false;
+	}
+	for (auto &program : programs) {
+		if (!RemapStorageToChunk(program.ops, program.null_cols, scan_projection, *get)) {
+			return false;
+		}
+	}
+	// keys: storage -> chunk positions
+	for (auto &key : keys) {
+		auto column_ids_idx = storage_to_column_ids_idx(NumericCast<idx_t>(key.scan_col));
+		bool found = false;
+		for (idx_t out = 0; out < scan_projection.size(); out++) {
+			if (scan_projection[out] == column_ids_idx) {
+				key.scan_col = NumericCast<int32_t>(out);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	}
 
-	vector<LogicalType> output_types = {group_type, aggr.return_type};
+	bool has_table_filters = !get->table_filters.filters.empty();
 
 	vector<string> col_keys;
 	string table_prefix;
@@ -1549,49 +1919,55 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 	if (table) {
 		table_prefix = table->ParentCatalog().GetName() + "." + table->ParentSchema().name + "." + table->name + "#";
 		total_rows = NumericCast<int64_t>(table->GetStorage().GetTotalRows());
-		auto storage_key_for_scan_col = [&](int32_t scan_col) -> string {
-			if (scan_col < 0) {
-				return "";
-			}
-			idx_t storage_idx = static_cast<idx_t>(scan_col);
-			if (!get->projection_ids.empty()) {
-				if (static_cast<size_t>(scan_col) >= get->projection_ids.size()) {
-					return "";
+		for (auto pid : cache_projection) {
+			col_keys.push_back(table_prefix + std::to_string(column_ids[pid].GetPrimaryIndex()));
+		}
+		for (auto &key : keys) {
+			key.cache_key = col_keys[key.scan_col];
+		}
+		cached = duckdb_mlx::MlxCacheHas(col_keys, total_rows);
+		if (cached) {
+			for (auto &key : keys) {
+				if (key.is_varchar &&
+				    duckdb_mlx::MlxDictCard(key.cache_key, duckdb_mlx::MlxCachePopulation(key.cache_key)) <= 0) {
+					cached = false;
+					break;
 				}
-				storage_idx = get->projection_ids[scan_col];
 			}
-			if (storage_idx >= get->GetColumnIds().size()) {
-				return "";
-			}
-			return table_prefix + std::to_string(get->GetColumnIds()[storage_idx].GetPrimaryIndex());
-		};
-		auto group_key = storage_key_for_scan_col(group_col);
-		auto value_key = storage_key_for_scan_col(value_col);
-		if (!group_key.empty() && !value_key.empty() && !has_filter) {
-			col_keys = {group_key, value_key};
-			// serving from the cache requires provable correctness: dense
-			// table ready, or fp32-exact NULL-free keys per zone maps
-			cached =
-			    duckdb_mlx::MlxCacheHas(col_keys, total_rows) && duckdb_mlx::MlxGroupbyCachedSafe(group_key, value_key);
 		}
 	}
 
-	if (has_filter) {
-		col_keys.clear();
-		cached = false;
-	}
+	get->projection_ids = std::move(scan_projection);
+	bool skip_cache_populate = has_table_filters;
 
-	auto mlx_op = make_uniq<MlxGroupbyLogicalOperator>(agg.group_index, agg.aggregate_index, group_col, value_col,
-	                                                   std::move(output_types), std::move(col_keys),
-	                                                   std::move(table_prefix), total_rows, cached);
+	auto mlx_op = make_uniq<MlxGroupedLogicalOperator>(agg.group_index, agg.aggregate_index, std::move(keys),
+	                                                   std::move(programs), std::move(agg_types),
+	                                                   std::move(cache_filter), std::move(col_keys),
+	                                                   std::move(table_prefix), total_rows, cached,
+	                                                   skip_cache_populate);
+	if (parent_proj) {
+		mlx_op->single_binding = true;
+		mlx_op->output_index = parent_proj->table_index;
+		mlx_op->output_map = std::move(output_map);
+	}
 	mlx_op->estimated_cardinality = agg.estimated_cardinality;
 	mlx_op->has_estimated_cardinality = agg.has_estimated_cardinality;
 	if (!cached) {
-		mlx_op->children.push_back(std::move(agg.children[0]));
+		// splice the projection chain out: programs and keys are expressed
+		// over the scan's output columns
+		if (!projs.empty()) {
+			mlx_op->children.push_back(std::move(projs.back()->children[0]));
+		} else {
+			mlx_op->children.push_back(std::move(agg.children[0]));
+		}
 	}
 	plan = std::move(mlx_op);
+	duckdb_mlx::LogDebug(cached ? "MLX_GROUPBY serving from the GPU-resident cache (no scan)"
+	                            : "MLX_GROUPBY intercepted a grouped aggregation");
 	return true;
 }
+
+
 
 static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOperator> &plan, idx_t min_rows) {
 	if (plan->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -1682,158 +2058,12 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 	}
 	cache_filter.null_cols.assign(filter_cols.begin(), filter_cols.end());
 
-	// interval bound of |program| per row from column statistics; declines
-	// int-lane sums whose exact int64 accumulation could overflow
-	auto program_abs_bound = [&](const MlxSumProgram &program, double &bound) {
-		std::vector<double> stack;
-		for (auto &op : program.ops) {
-			switch (op.code) {
-			case MlxExprOpCode::LOAD_COL: {
-				unique_ptr<BaseStatistics> stats;
-				if (get->function.statistics_extended) {
-					auto &column_ids = get->GetColumnIds();
-					idx_t pos = column_ids.size();
-					for (idx_t i = 0; i < column_ids.size(); i++) {
-						if (column_ids[i].GetPrimaryIndex() == static_cast<idx_t>(op.col)) {
-							pos = i;
-							break;
-						}
-					}
-					if (pos < column_ids.size()) {
-						TableFunctionGetStatisticsInput input(get->bind_data.get(), column_ids[pos]);
-						stats = get->function.statistics_extended(context, input);
-					}
-				}
-				if (!stats || !NumericStats::HasMinMax(*stats)) {
-					return false;
-				}
-				auto lo = NumericStats::Min(*stats).GetValue<double>();
-				auto hi = NumericStats::Max(*stats).GetValue<double>();
-				double raw_scale = 1.0;
-				auto &col_type = get->returned_types[op.col];
-				if (col_type.id() == LogicalTypeId::DECIMAL) {
-					raw_scale = static_cast<double>(MlxExprTranslator::Pow10(DecimalType::GetScale(col_type)));
-				}
-				stack.push_back(std::max(std::abs(lo), std::abs(hi)) * raw_scale);
-				break;
-			}
-			case MlxExprOpCode::CONST_VAL:
-				stack.push_back(op.int_lane ? std::abs(static_cast<double>(op.ivalue)) : std::abs(op.value));
-				break;
-			case MlxExprOpCode::ADD:
-			case MlxExprOpCode::SUB: {
-				auto b = stack.back();
-				stack.pop_back();
-				stack.back() += b;
-				break;
-			}
-			case MlxExprOpCode::MUL: {
-				auto b = stack.back();
-				stack.pop_back();
-				stack.back() *= b;
-				break;
-			}
-			case MlxExprOpCode::NEGATE:
-			case MlxExprOpCode::ABS:
-				break;
-			default:
-				return false;
-			}
-		}
-		bound = stack.empty() ? 0.0 : stack.back();
-		return true;
-	};
-
 	vector<MlxSumProgram> programs;
 	vector<LogicalType> agg_types;
-	for (auto &expr : agg.expressions) {
-		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
-			return false;
-		}
-		auto &aggr = expr->Cast<BoundAggregateExpression>();
-		if (aggr.IsDistinct() || aggr.filter) {
-			return false;
-		}
-		MlxSumProgram program;
-		auto &name = aggr.function.name;
-		if (name == "count_star" && aggr.children.empty()) {
-			program.kind = MlxAggKind::COUNT_STAR;
-		} else if (name == "count" && aggr.children.size() == 1) {
-			program.kind = MlxAggKind::COUNT;
-		} else if (aggr.children.size() == 1) {
-			if (name == "sum" || name == "sum_no_overflow") {
-				program.kind = MlxAggKind::SUM;
-			} else if (name == "avg") {
-				program.kind = MlxAggKind::AVG;
-			} else if (name == "min") {
-				program.kind = MlxAggKind::MIN;
-			} else if (name == "max") {
-				program.kind = MlxAggKind::MAX;
-			} else {
-				return false;
-			}
-		} else {
-			return false;
-		}
-		if (!aggr.children.empty()) {
-			MlxExprTranslator translator(*get, proj);
-			MlxExprTranslator::Lane lane;
-			if (!translator.Translate(*aggr.children[0], lane) || lane == MlxExprTranslator::Lane::BOOL_LANE) {
-				return false;
-			}
-			program.int_lane = lane == MlxExprTranslator::Lane::INT_LANE;
-			program.ops = std::move(translator.ops);
-			program.null_cols.assign(translator.referenced_cols.begin(), translator.referenced_cols.end());
-		}
-
-		// result typing: exact DECIMAL results ride the int lane
-		if (program.kind == MlxAggKind::COUNT || program.kind == MlxAggKind::COUNT_STAR) {
-			if (aggr.return_type.id() != LogicalTypeId::BIGINT) {
-				return false;
-			}
-			agg_types.push_back(LogicalType::BIGINT);
-		} else if (program.int_lane) {
-			auto &child_type = aggr.children[0]->return_type;
-			if (child_type.id() != LogicalTypeId::DECIMAL) {
-				return false;
-			}
-			auto child_scale = DecimalType::GetScale(child_type);
-			switch (program.kind) {
-			case MlxAggKind::SUM:
-				if (aggr.return_type.id() != LogicalTypeId::DECIMAL ||
-				    DecimalType::GetScale(aggr.return_type) != child_scale) {
-					return false;
-				}
-				agg_types.push_back(aggr.return_type);
-				break;
-			case MlxAggKind::AVG:
-				if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
-					return false;
-				}
-				program.render_scale = 1.0 / static_cast<double>(MlxExprTranslator::Pow10(child_scale));
-				agg_types.push_back(LogicalType::DOUBLE);
-				break;
-			default: // MIN / MAX keep the child's decimal type
-				if (aggr.return_type != child_type) {
-					return false;
-				}
-				agg_types.push_back(aggr.return_type);
-				break;
-			}
-			if (program.kind == MlxAggKind::SUM || program.kind == MlxAggKind::AVG) {
-				double bound = 0;
-				if (!program_abs_bound(program, bound) ||
-				    bound * static_cast<double>(std::max<idx_t>(estimated_rows, 1)) >= std::ldexp(1.0, 61)) {
-					return false; // exact int64 accumulation could overflow
-				}
-			}
-		} else {
-			if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
-				return false;
-			}
-			agg_types.push_back(LogicalType::DOUBLE);
-		}
-		programs.push_back(std::move(program));
+	if (!BuildAggregatePrograms(context, get, proj ? vector<LogicalProjection *> {proj.get()}
+	                                               : vector<LogicalProjection *> {},
+	                            agg, estimated_rows, false, programs, agg_types)) {
+		return false;
 	}
 
 	// DuckDB 1.5.4 column model: scan projection carries agg columns only;
@@ -1962,6 +2192,205 @@ static void MlxOptimizeFunction(OptimizerExtensionInput &input, unique_ptr<Logic
 		min_rows = min_rows_value.GetValue<idx_t>();
 	}
 	WalkPlan(input.context, plan, min_rows);
+}
+
+static bool ColumnPinSupported(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::DECIMAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
+struct PinColumnBuffer {
+	vector<float> values;
+	vector<int64_t> ivalues;
+	vector<uint8_t> valid;
+	bool is_varchar = false;
+	bool is_int_lane = false;
+	unordered_map<string, int32_t> dict;
+	vector<string> dict_strings;
+};
+
+static void AppendPinVarchar(UnifiedVectorFormat &fmt, idx_t count, vector<float> &values,
+                             unordered_map<string, int32_t> &dict, vector<string> &decode) {
+	auto strings = UnifiedVectorFormat::GetData<string_t>(fmt);
+	auto base = values.size();
+	values.resize(base + count);
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = fmt.sel->get_index(i);
+		if (!fmt.validity.RowIsValid(idx)) {
+			values[base + i] = -1.0f;
+			continue;
+		}
+		auto str = strings[idx].GetString();
+		auto it = dict.find(str);
+		int32_t code;
+		if (it != dict.end()) {
+			code = it->second;
+		} else {
+			code = NumericCast<int32_t>(decode.size());
+			decode.push_back(str);
+			dict.emplace(str, code);
+		}
+		values[base + i] = static_cast<float>(code);
+	}
+}
+
+static void PinChunkColumns(DataChunk &chunk, vector<PinColumnBuffer> &columns, const vector<idx_t> &chunk_to_table) {
+	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+		auto table_col = chunk_to_table[col];
+		auto &buf = columns[table_col];
+		UnifiedVectorFormat fmt;
+		chunk.data[col].ToUnifiedFormat(chunk.size(), fmt);
+		if (buf.is_varchar) {
+			AppendPinVarchar(fmt, chunk.size(), buf.values, buf.dict, buf.dict_strings);
+			continue;
+		}
+		if (!AppendLaneColumn(chunk.data[col].GetType(), fmt, chunk.size(), buf.values, buf.ivalues, buf.valid)) {
+			throw InternalException("mlx_cache_pin: unsupported column type %s at execution time",
+			                        chunk.data[col].GetType().ToString());
+		}
+	}
+}
+
+static void PinBuffersToMlxColumns(const vector<PinColumnBuffer> &columns, const vector<idx_t> &pinned_table_cols,
+                                   vector<duckdb_mlx::MlxColumnData> &out) {
+	for (auto table_col : pinned_table_cols) {
+		auto &buf = columns[table_col];
+		duckdb_mlx::MlxColumnData data;
+		data.valid = buf.valid.empty() ? nullptr : buf.valid.data();
+		if (!buf.ivalues.empty()) {
+			data.ivalues = buf.ivalues.data();
+		} else {
+			data.values = buf.values.data();
+		}
+		out.push_back(data);
+	}
+}
+
+MlxCachePinResult MlxCachePinTable(ClientContext &context, const string &table_name) {
+	MlxCachePinResult result;
+	auto qn = QualifiedName::Parse(table_name);
+	CatalogEntryRetriever retriever(context);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, qn.name);
+	optional_ptr<CatalogEntry> entry_ptr;
+	if (!qn.catalog.empty() || !qn.schema.empty()) {
+		entry_ptr = retriever.GetEntry(qn.catalog.empty() ? INVALID_CATALOG : qn.catalog,
+		                               qn.schema.empty() ? DEFAULT_SCHEMA : qn.schema, lookup);
+	} else {
+		for (auto &path : retriever.GetSearchPath().Get()) {
+			entry_ptr = retriever.GetEntry(path.catalog, path.schema, lookup, OnEntryNotFound::RETURN_NULL);
+			if (entry_ptr) {
+				break;
+			}
+		}
+		if (!entry_ptr) {
+			throw CatalogException("Table \"%s\" not found", qn.name);
+		}
+	}
+	if (entry_ptr->type != CatalogType::TABLE_ENTRY) {
+		throw InvalidInputException("mlx_cache_pin: '%s' is not a table", table_name);
+	}
+	auto &table = entry_ptr->Cast<TableCatalogEntry>();
+	auto &storage = table.GetStorage();
+	auto total_rows = NumericCast<int64_t>(storage.GetTotalRows());
+	if (total_rows == 0) {
+		return result;
+	}
+
+	string table_prefix =
+	    table.ParentCatalog().GetName() + "." + table.schema.name + "." + table.name + "#";
+	auto types = storage.GetTypes();
+	vector<StorageIndex> storage_ids;
+	vector<string> col_keys;
+	vector<idx_t> pinned_table_cols;
+	vector<bool> pin_col(types.size(), false);
+	vector<PinColumnBuffer> columns(types.size());
+	vector<LogicalType> scan_types;
+
+	for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
+		if (!ColumnPinSupported(types[col_idx])) {
+			continue;
+		}
+		storage_ids.emplace_back(col_idx);
+		pinned_table_cols.push_back(col_idx);
+		scan_types.push_back(types[col_idx]);
+		col_keys.push_back(table_prefix + std::to_string(col_idx));
+		pin_col[col_idx] = true;
+		auto &buf = columns[col_idx];
+		buf.is_varchar = types[col_idx].id() == LogicalTypeId::VARCHAR;
+		buf.is_int_lane = types[col_idx].id() == LogicalTypeId::DECIMAL;
+	}
+	if (col_keys.empty()) {
+		throw InvalidInputException("mlx_cache_pin: no pin-able columns in table '%s'", table_name);
+	}
+
+	if (duckdb_mlx::MlxCacheHas(col_keys, total_rows)) {
+		result.rows = total_rows;
+		result.columns = NumericCast<int64_t>(col_keys.size());
+		result.already_resident = true;
+		duckdb_mlx::MlxCacheFuseTable(table_prefix);
+		duckdb_mlx::LogDebug("mlx_cache_pin: " + table.name + " already resident (" + std::to_string(total_rows) +
+		                     " rows)");
+		return result;
+	}
+
+	auto plan = duckdb_mlx::MlxCacheBeginPopulation(table_prefix, col_keys, total_rows);
+	auto &transaction = DuckTransaction::Get(context, table.catalog);
+	TableScanState scan_state;
+	storage.InitializeScan(context, transaction, scan_state, storage_ids, nullptr);
+
+	DataChunk chunk;
+	chunk.Initialize(context, scan_types);
+	vector<idx_t> chunk_to_table = pinned_table_cols;
+	while (true) {
+		chunk.Reset();
+		storage.Scan(transaction, chunk, scan_state);
+		if (chunk.size() == 0) {
+			break;
+		}
+		PinChunkColumns(chunk, columns, chunk_to_table);
+		vector<duckdb_mlx::MlxColumnData> mlx_cols;
+		PinBuffersToMlxColumns(columns, pinned_table_cols, mlx_cols);
+		duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, mlx_cols, chunk.size());
+		for (auto table_col : pinned_table_cols) {
+			columns[table_col].values.clear();
+			columns[table_col].ivalues.clear();
+			columns[table_col].valid.clear();
+		}
+	}
+
+	duckdb_mlx::MlxCacheFuseTable(table_prefix);
+
+	for (auto table_col : pinned_table_cols) {
+		if (!columns[table_col].is_varchar) {
+			continue;
+		}
+		duckdb_mlx::MlxDictInstall(table_prefix + std::to_string(table_col), plan.population,
+		                           columns[table_col].dict_strings);
+	}
+
+	result.rows = total_rows;
+	result.columns = NumericCast<int64_t>(col_keys.size());
+	duckdb_mlx::LogDebug("mlx_cache_pin: pinned " + table.name + " (" + std::to_string(result.rows) + " rows, " +
+	                     std::to_string(result.columns) + " columns)");
+	return result;
+}
+
+void MlxCachePinTpch(ClientContext &context) {
+	static const char *tables[] = {"customer", "lineitem", "nation", "orders", "part", "partsupp", "region",
+	                               "supplier"};
+	for (auto *name : tables) {
+		MlxCachePinTable(context, name);
+	}
 }
 
 void RegisterMlxOptimizer(DatabaseInstance &db) {
