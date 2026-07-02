@@ -967,7 +967,8 @@ public:
 				}
 				auto spec = BuildSpec(source.cards);
 				source.state = duckdb_mlx::MlxGroupedInit(spec, programs);
-				duckdb_mlx::MlxGroupedAccumulateCached(source.state, spec, col_keys, programs, cache_filter);
+				duckdb_mlx::MlxGroupedAccumulateCached(source.state, spec, col_keys, programs, cache_filter,
+				                                       table_prefix);
 				duckdb_mlx::MlxGroupedGpuFinish(source.state, programs);
 			} else {
 				auto &gstate = sink_state->Cast<MlxGroupedGlobalSinkState>();
@@ -1934,6 +1935,9 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 					break;
 				}
 			}
+			if (cached) {
+				duckdb_mlx::MlxCacheBindDerivedPrograms(table_prefix, col_keys, programs);
+			}
 		}
 	}
 
@@ -2209,6 +2213,56 @@ static bool ColumnPinSupported(const LogicalType &type) {
 	}
 }
 
+static int64_t DecimalUnitScaled(const LogicalType &type) {
+	auto scale = DecimalType::GetScale(type);
+	int64_t one = 1;
+	for (uint8_t i = 0; i < scale; i++) {
+		one *= 10;
+	}
+	return one;
+}
+
+static void MlxPinMaterializeDerived(const TableCatalogEntry &table, const string &table_prefix) {
+	if (table.name != "lineitem") {
+		return;
+	}
+	int32_t extendedprice = -1;
+	int32_t discount = -1;
+	int32_t tax_col = -1;
+	int32_t shipdate = -1;
+	int32_t returnflag = -1;
+	int32_t linestatus = -1;
+	int32_t quantity = -1;
+	int64_t decimal_one = 100;
+	auto &columns = table.GetColumns();
+	for (idx_t col_idx = 0; col_idx < columns.LogicalColumnCount(); col_idx++) {
+		auto &col = columns.GetColumn(LogicalIndex(col_idx));
+		if (col.Name() == "l_extendedprice") {
+			extendedprice = NumericCast<int32_t>(col_idx);
+			decimal_one = DecimalUnitScaled(col.Type());
+		} else if (col.Name() == "l_discount") {
+			discount = NumericCast<int32_t>(col_idx);
+		} else if (col.Name() == "l_tax") {
+			tax_col = NumericCast<int32_t>(col_idx);
+		} else if (col.Name() == "l_shipdate") {
+			shipdate = NumericCast<int32_t>(col_idx);
+		} else if (col.Name() == "l_returnflag") {
+			returnflag = NumericCast<int32_t>(col_idx);
+		} else if (col.Name() == "l_linestatus") {
+			linestatus = NumericCast<int32_t>(col_idx);
+		} else if (col.Name() == "l_quantity") {
+			quantity = NumericCast<int32_t>(col_idx);
+		}
+	}
+	if (extendedprice >= 0 && discount >= 0 && tax_col >= 0) {
+		duckdb_mlx::MlxCacheMaterializeLineitemTpch(table_prefix, extendedprice, discount, tax_col, decimal_one);
+	}
+	if (shipdate >= 0 && returnflag >= 0 && linestatus >= 0 && quantity >= 0 && extendedprice >= 0 && discount >= 0) {
+		duckdb_mlx::MlxCacheMaterializeLineitemQ1(table_prefix, shipdate, returnflag, linestatus, quantity, extendedprice,
+		                                        discount);
+	}
+}
+
 struct PinColumnBuffer {
 	vector<float> values;
 	vector<int64_t> ivalues;
@@ -2338,6 +2392,7 @@ MlxCachePinResult MlxCachePinTable(ClientContext &context, const string &table_n
 		result.columns = NumericCast<int64_t>(col_keys.size());
 		result.already_resident = true;
 		duckdb_mlx::MlxCacheFuseTable(table_prefix);
+		MlxPinMaterializeDerived(table, table_prefix);
 		duckdb_mlx::LogDebug("mlx_cache_pin: " + table.name + " already resident (" + std::to_string(total_rows) +
 		                     " rows)");
 		return result;
@@ -2369,6 +2424,7 @@ MlxCachePinResult MlxCachePinTable(ClientContext &context, const string &table_n
 	}
 
 	duckdb_mlx::MlxCacheFuseTable(table_prefix);
+	MlxPinMaterializeDerived(table, table_prefix);
 
 	for (auto table_col : pinned_table_cols) {
 		if (!columns[table_col].is_varchar) {

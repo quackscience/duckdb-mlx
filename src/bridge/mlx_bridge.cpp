@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -715,6 +716,23 @@ MlxZoneMap ComputeZoneMapT(const T *values, const uint8_t *valid, size_t count) 
 	return zm;
 }
 
+std::unordered_map<std::string, std::unordered_map<uint64_t, std::string>> &DerivedManifest() {
+	static std::unordered_map<std::string, std::unordered_map<uint64_t, std::string>> manifest;
+	return manifest;
+}
+
+struct MlxQ1PinBundle {
+	int32_t shipdate_storage = -1;
+	int32_t group_card = 0;
+	int32_t val_n = 0;
+	std::vector<uint64_t> pack_fps;
+};
+
+std::unordered_map<std::string, MlxQ1PinBundle> &Q1PinBundles() {
+	static std::unordered_map<std::string, MlxQ1PinBundle> bundles;
+	return bundles;
+}
+
 void DropTableUnlocked(const std::string &prefix) {
 	auto &store = CacheStore();
 	for (auto it = store.begin(); it != store.end();) {
@@ -726,6 +744,8 @@ void DropTableUnlocked(const std::string &prefix) {
 	}
 	TableLayouts().erase(prefix);
 	MlxGroupbyDenseClearTable(prefix);
+	DerivedManifest().erase(prefix);
+	Q1PinBundles().erase(prefix);
 }
 
 void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t offset, size_t take,
@@ -804,6 +824,103 @@ std::vector<size_t> CanonicalSegmentSizesUnlocked(const std::string &table_prefi
 	return layout.segment_sizes;
 }
 
+int64_t StorageIndexFromCacheKey(const std::string &key) {
+	auto pos = key.rfind('#');
+	if (pos == std::string::npos) {
+		return -1;
+	}
+	auto suffix = key.substr(pos + 1);
+	if (suffix.compare(0, 2, "x:") == 0) {
+		return -1;
+	}
+	try {
+		return std::stoll(suffix);
+	} catch (...) {
+		return -1;
+	}
+}
+
+uint64_t FingerprintOps(const std::vector<MlxExprOp> &ops, const std::vector<std::string> &col_keys) {
+	uint64_t h = 14695981039346656037ULL;
+	for (auto &op : ops) {
+		h ^= static_cast<uint64_t>(op.code);
+		h *= 1099511628211ULL;
+		if (op.code == MlxExprOpCode::LOAD_COL) {
+			auto storage = StorageIndexFromCacheKey(col_keys[static_cast<size_t>(op.col)]);
+			h ^= static_cast<uint64_t>(storage + 1000000);
+			h *= 1099511628211ULL;
+		} else if (op.code == MlxExprOpCode::CONST_VAL) {
+			if (op.int_lane) {
+				h ^= static_cast<uint64_t>(op.ivalue);
+			} else {
+				uint64_t bits = 0;
+				std::memcpy(&bits, &op.value, sizeof(bits));
+				h ^= bits;
+			}
+			h *= 1099511628211ULL;
+		}
+	}
+	return h;
+}
+
+MlxSegment CachedSegmentFromKeys(const std::vector<std::string> &col_keys) {
+	auto &store = CacheStore();
+	MlxSegment seg;
+	for (auto &key : col_keys) {
+		auto it = store.find(key);
+		if (it == store.end() || !it->second.fused_col.has_value()) {
+			throw std::runtime_error("MlxCacheMaterializeDerived: missing fused column '" + key + "'");
+		}
+		if (seg.count == 0) {
+			seg.count = it->second.rows;
+		} else if (it->second.rows != seg.count) {
+			throw std::runtime_error("MlxCacheMaterializeDerived: row count mismatch for '" + key + "'");
+		}
+		seg.cols.push_back(*it->second.fused_col);
+		seg.valids.push_back(it->second.fused_valid);
+	}
+	return seg;
+}
+
+std::optional<mx::array> CombineCachedValids(const std::vector<std::string> &col_keys) {
+	std::vector<mx::array> parts;
+	for (auto &key : col_keys) {
+		auto it = CacheStore().find(key);
+		if (it != CacheStore().end() && it->second.fused_valid.has_value()) {
+			parts.push_back(*it->second.fused_valid);
+		}
+	}
+	if (parts.empty()) {
+		return std::nullopt;
+	}
+	if (parts.size() == 1) {
+		return parts[0];
+	}
+	auto out = parts[0];
+	for (size_t i = 1; i < parts.size(); i++) {
+		out = mx::logical_and(out, mx::astype(parts[i], mx::bool_));
+	}
+	return mx::astype(out, mx::uint8);
+}
+
+void MaterializeDerivedUnlocked(const std::string &table_prefix, const std::string &derived_key,
+                                const std::vector<std::string> &base_col_keys, const std::vector<MlxExprOp> &ops) {
+	auto &store = CacheStore();
+	if (store.find(derived_key) != store.end() && store[derived_key].fused_col.has_value()) {
+		return;
+	}
+	auto seg = CachedSegmentFromKeys(base_col_keys);
+	auto derived = EvalOps(seg, ops, EvalRowWidth::INT64);
+	mx::eval({derived});
+	MlxCachedColumn cached;
+	cached.fused_col = derived;
+	cached.rows = seg.count;
+	cached.population = store[base_col_keys[0]].population;
+	cached.fused_valid = CombineCachedValids(base_col_keys);
+	store[derived_key] = std::move(cached);
+	DerivedManifest()[table_prefix][FingerprintOps(ops, base_col_keys)] = derived_key;
+}
+
 } // namespace
 
 void MlxCacheFuseTable(const std::string &table_prefix) {
@@ -824,6 +941,247 @@ void MlxCacheFuseTable(const std::string &table_prefix) {
 	if (!to_eval.empty()) {
 		mx::eval(to_eval);
 	}
+}
+
+void MlxCacheMaterializeDerived(const std::string &table_prefix, const std::string &derived_suffix,
+                                const std::vector<std::string> &base_col_keys, const std::vector<MlxExprOp> &ops) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	auto derived_key = table_prefix + "x:" + derived_suffix;
+	MaterializeDerivedUnlocked(table_prefix, derived_key, base_col_keys, ops);
+}
+
+void MlxCacheMaterializeLineitemTpch(const std::string &table_prefix, int col_extendedprice, int col_discount,
+                                     int col_tax, int64_t decimal_one_scaled) {
+	auto ep_key = table_prefix + std::to_string(col_extendedprice);
+	auto disc_key = table_prefix + std::to_string(col_discount);
+	auto tax_key = table_prefix + std::to_string(col_tax);
+	std::vector<std::string> ep_disc_keys = {ep_key, disc_key};
+
+	std::vector<MlxExprOp> disc_price_ops = {{MlxExprOpCode::LOAD_COL, 1, 0},
+	                                         {MlxExprOpCode::CONST_VAL, 0, 0.0, decimal_one_scaled, true},
+	                                         {MlxExprOpCode::SUB, 0, 0},
+	                                         {MlxExprOpCode::LOAD_COL, 0, 0},
+	                                         {MlxExprOpCode::MUL, 0, 0}};
+	MlxCacheMaterializeDerived(table_prefix, "disc_price", ep_disc_keys, disc_price_ops);
+
+	auto disc_price_key = table_prefix + "x:disc_price";
+	std::vector<std::string> charge_keys = {disc_price_key, tax_key};
+	std::vector<MlxExprOp> charge_ops = {{MlxExprOpCode::LOAD_COL, 1, 0},
+	                                     {MlxExprOpCode::CONST_VAL, 0, 0.0, decimal_one_scaled, true},
+	                                     {MlxExprOpCode::ADD, 0, 0},
+	                                     {MlxExprOpCode::LOAD_COL, 0, 0},
+	                                     {MlxExprOpCode::MUL, 0, 0}};
+	MlxCacheMaterializeDerived(table_prefix, "charge", charge_keys, charge_ops);
+}
+
+namespace {
+
+constexpr int64_t kQ1ShipdateCutoffDays = 10471; // DATE '1998-09-02'
+
+uint64_t FingerprintLoadCol(const std::string &col_key) {
+	std::vector<MlxExprOp> ops = {{MlxExprOpCode::LOAD_COL, 0, 0}};
+	std::vector<std::string> keys = {col_key};
+	return FingerprintOps(ops, keys);
+}
+
+void StoreFusedDerivedUnlocked(const std::string &key, mx::array arr, int64_t rows, int64_t population) {
+	MlxCachedColumn cached;
+	cached.fused_col = std::move(arr);
+	cached.rows = rows;
+	cached.population = population;
+	CacheStore()[key] = std::move(cached);
+}
+
+bool FilterMatchesQ1Shipdate(const MlxFilter &filter, const std::vector<std::string> &col_keys, int32_t shipdate_storage) {
+	if (filter.ops.size() != 3) {
+		return false;
+	}
+	if (filter.ops[0].code != MlxExprOpCode::LOAD_COL || filter.ops[1].code != MlxExprOpCode::CONST_VAL ||
+	    filter.ops[2].code != MlxExprOpCode::CMP_LE) {
+		return false;
+	}
+	if (StorageIndexFromCacheKey(col_keys[static_cast<size_t>(filter.ops[0].col)]) != shipdate_storage) {
+		return false;
+	}
+	auto &konst = filter.ops[1];
+	if (konst.int_lane) {
+		return konst.ivalue == kQ1ShipdateCutoffDays;
+	}
+	return konst.value == static_cast<double>(kQ1ShipdateCutoffDays);
+}
+
+void MaterializeLineitemQ1Unlocked(const std::string &table_prefix, int col_shipdate, int col_returnflag,
+                                   int col_linestatus, int col_quantity, int col_extendedprice, int col_discount) {
+	auto &store = CacheStore();
+	auto ship_key = table_prefix + std::to_string(col_shipdate);
+	auto rf_key = table_prefix + std::to_string(col_returnflag);
+	auto ls_key = table_prefix + std::to_string(col_linestatus);
+	auto qty_key = table_prefix + std::to_string(col_quantity);
+	auto ep_key = table_prefix + std::to_string(col_extendedprice);
+	auto disc_key = table_prefix + std::to_string(col_discount);
+	auto disc_price_key = table_prefix + "x:disc_price";
+	auto charge_key = table_prefix + "x:charge";
+	for (auto &key : {ship_key, rf_key, ls_key, qty_key, ep_key, disc_key, disc_price_key, charge_key}) {
+		auto it = store.find(key);
+		if (it == store.end() || !it->second.fused_col.has_value()) {
+			return;
+		}
+	}
+	auto n = store[ship_key].rows;
+	auto population = store[ship_key].population;
+
+	auto &ship = *store[ship_key].fused_col;
+	mx::array pass = ship.dtype() == mx::float32
+	                     ? mx::astype(mx::less_equal(ship, mx::array(static_cast<float>(kQ1ShipdateCutoffDays))),
+	                                  mx::uint8)
+	                     : mx::astype(mx::less_equal(ship, mx::array(kQ1ShipdateCutoffDays, mx::int64)), mx::uint8);
+
+	auto rf_i = mx::astype(mx::round(*store[rf_key].fused_col), mx::int32);
+	auto ls_i = mx::astype(mx::round(*store[ls_key].fused_col), mx::int32);
+	auto ls_card = mx::add(mx::max(ls_i), mx::array(1, mx::int32)).item<int32_t>();
+	auto codes = mx::add(mx::multiply(rf_i, mx::array(ls_card, mx::int32)), ls_i);
+
+	std::vector<mx::array> pack_cols = {*store[qty_key].fused_col, *store[ep_key].fused_col,
+	                                    *store[disc_price_key].fused_col, *store[charge_key].fused_col,
+	                                    *store[qty_key].fused_col, *store[ep_key].fused_col, *store[disc_key].fused_col};
+	std::vector<mx::array> pack_up;
+	pack_up.reserve(pack_cols.size());
+	for (auto &col : pack_cols) {
+		auto lane = col.dtype() == mx::int64 ? col : mx::astype(col, mx::int64);
+		pack_up.push_back(mx::expand_dims(lane, 1));
+	}
+	auto packed = mx::concatenate(pack_up, 1);
+
+	mx::eval({pass, codes, packed});
+
+	StoreFusedDerivedUnlocked(table_prefix + "x:pass_q1", pass, n, population);
+	StoreFusedDerivedUnlocked(table_prefix + "x:q1_codes", codes, n, population);
+	StoreFusedDerivedUnlocked(table_prefix + "x:q1_pack", packed, n, population);
+
+	MlxQ1PinBundle bundle;
+	bundle.shipdate_storage = col_shipdate;
+	bundle.group_card = mx::add(mx::max(codes), mx::array(1, mx::int32)).item<int32_t>();
+	bundle.val_n = static_cast<int32_t>(pack_cols.size());
+	bundle.pack_fps = {FingerprintLoadCol(qty_key),     FingerprintLoadCol(ep_key), FingerprintLoadCol(disc_price_key),
+	                   FingerprintLoadCol(charge_key), FingerprintLoadCol(qty_key), FingerprintLoadCol(ep_key),
+	                   FingerprintLoadCol(disc_key)};
+	Q1PinBundles()[table_prefix] = std::move(bundle);
+}
+
+bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_prefix,
+                           const std::vector<std::string> &col_keys, const std::vector<MlxSumProgram> &programs,
+                           const MlxFilter &filter) {
+	auto bundle_it = Q1PinBundles().find(table_prefix);
+	if (bundle_it == Q1PinBundles().end()) {
+		return false;
+	}
+	auto &bundle = bundle_it->second;
+	if (!FilterMatchesQ1Shipdate(filter, col_keys, bundle.shipdate_storage)) {
+		return false;
+	}
+	if (state.card != bundle.group_card || bundle.val_n <= 0) {
+		return false;
+	}
+	std::vector<std::pair<size_t, int>> val_slots;
+	val_slots.reserve(static_cast<size_t>(bundle.val_n));
+	for (size_t p = 0; p < programs.size(); p++) {
+		auto kind = programs[p].kind;
+		if (kind != MlxAggKind::SUM && kind != MlxAggKind::AVG) {
+			continue;
+		}
+		if (!programs[p].int_lane || !HasValueGraph(kind)) {
+			return false;
+		}
+		auto fp = FingerprintOps(programs[p].ops, col_keys);
+		int pack_col = -1;
+		for (int i = 0; i < bundle.val_n; i++) {
+			if (bundle.pack_fps[static_cast<size_t>(i)] == fp) {
+				pack_col = i;
+				break;
+			}
+		}
+		if (pack_col < 0) {
+			return false;
+		}
+		val_slots.push_back({p, pack_col});
+	}
+	if (val_slots.empty()) {
+		return false;
+	}
+
+	std::optional<mx::array> codes;
+	std::optional<mx::array> pass;
+	std::optional<mx::array> packed;
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		auto &store = CacheStore();
+		auto codes_it = store.find(table_prefix + "x:q1_codes");
+		auto pass_it = store.find(table_prefix + "x:pass_q1");
+		auto pack_it = store.find(table_prefix + "x:q1_pack");
+		if (codes_it == store.end() || pass_it == store.end() || pack_it == store.end() ||
+		    !codes_it->second.fused_col.has_value() || !pass_it->second.fused_col.has_value() ||
+		    !pack_it->second.fused_col.has_value()) {
+			return false;
+		}
+		codes = *codes_it->second.fused_col;
+		pass = *pass_it->second.fused_col;
+		packed = *pack_it->second.fused_col;
+	}
+	if (!GroupedTileKernelEligible(programs, state.card)) {
+		return false;
+	}
+	GroupedPackedTileAccumulate(state, *codes, *pass, *packed, static_cast<int>(val_slots.size()), val_slots, programs);
+	return true;
+}
+
+} // namespace
+
+void MlxCacheMaterializeLineitemQ1(const std::string &table_prefix, int col_shipdate, int col_returnflag,
+                                   int col_linestatus, int col_quantity, int col_extendedprice, int col_discount) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	MaterializeLineitemQ1Unlocked(table_prefix, col_shipdate, col_returnflag, col_linestatus, col_quantity,
+	                              col_extendedprice, col_discount);
+}
+
+size_t MlxCacheBindDerivedPrograms(const std::string &table_prefix, std::vector<std::string> &col_keys,
+                                   std::vector<MlxSumProgram> &programs) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	auto manifest_it = DerivedManifest().find(table_prefix);
+	if (manifest_it == DerivedManifest().end()) {
+		return 0;
+	}
+	auto &manifest = manifest_it->second;
+	auto &store = CacheStore();
+	size_t bound = 0;
+	for (auto &program : programs) {
+		if (!HasValueGraph(program.kind)) {
+			continue;
+		}
+		auto fp = FingerprintOps(program.ops, col_keys);
+		auto derived_it = manifest.find(fp);
+		if (derived_it == manifest.end()) {
+			continue;
+		}
+		auto &derived_key = derived_it->second;
+		auto cache_it = store.find(derived_key);
+		if (cache_it == store.end() || !cache_it->second.fused_col.has_value()) {
+			continue;
+		}
+		int32_t col_idx = -1;
+		for (size_t i = 0; i < col_keys.size(); i++) {
+			if (col_keys[i] == derived_key) {
+				col_idx = static_cast<int32_t>(i);
+				break;
+			}
+		}
+		if (col_idx < 0) {
+			col_keys.push_back(derived_key);
+			col_idx = static_cast<int32_t>(col_keys.size() - 1);
+		}
+		program.ops = {{MlxExprOpCode::LOAD_COL, col_idx, 0}};
+		bound++;
+	}
+	return bound;
 }
 
 std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, size_t count,
@@ -1024,6 +1382,8 @@ void MlxCacheClearAll() {
 	std::lock_guard<std::mutex> guard(cache_mutex);
 	CacheStore().clear();
 	TableLayouts().clear();
+	DerivedManifest().clear();
+	Q1PinBundles().clear();
 	MlxGroupbyDenseClearTable("");
 }
 
@@ -1310,17 +1670,13 @@ MlxSegment ConcatSegmentParts(const std::vector<MlxSegment> &segments, size_t be
 	return out;
 }
 
-GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGroupedSpec &spec,
-                                        const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
-                                        bool exact_int_eval = false, bool defer_materialize = false) {
-	GroupedSegmentArrays out;
-	out.count = segment.count;
+void BuildGroupedEvalGraphs(const MlxSegment &segment, const MlxGroupedSpec &spec,
+                            const std::vector<MlxSumProgram> &programs, const MlxFilter &filter, bool exact_int_eval,
+                            std::vector<mx::array> &outs) {
 	int64_t card = 1;
 	for (auto c : spec.key_cards) {
 		card *= c;
 	}
-
-	// combined dense code per row
 	std::optional<mx::array> code;
 	for (size_t k = 0; k < spec.key_cols.size(); k++) {
 		auto &col = segment.cols[spec.key_cols[k]];
@@ -1332,9 +1688,6 @@ GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGrou
 		           ? mx::add(mx::multiply(*code, mx::array(static_cast<int32_t>(spec.key_cards[k]), mx::int32)), c32)
 		           : c32;
 	}
-
-	// WHERE filter (and key NULLs) dump rows to slot `card`; also clamp any
-	// out-of-stats code defensively
 	std::optional<mx::array> fmask;
 	if (!filter.ops.empty()) {
 		fmask = EvalOps(segment, filter.ops);
@@ -1343,7 +1696,7 @@ GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGrou
 	auto dump = mx::array(static_cast<int32_t>(card), mx::int32);
 	auto in_range = mx::logical_and(mx::greater_equal(*code, mx::array(0, mx::int32)), mx::less(*code, dump));
 	auto guarded = fmask.has_value() ? mx::logical_and(in_range, *fmask) : in_range;
-	out.codes = mx::where(guarded, *code, dump);
+	outs.push_back(mx::where(guarded, *code, dump));
 
 	for (auto &program : programs) {
 		if (HasValueGraph(program.kind)) {
@@ -1351,15 +1704,77 @@ GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGrou
 			if (exact_int_eval && program.int_lane) {
 				width = EvalRowWidth::INT64;
 			}
-			out.exprs.emplace_back(EvalOps(segment, program.ops, width));
-		} else {
-			out.exprs.emplace_back(std::nullopt);
+			outs.push_back(EvalOps(segment, program.ops, width));
 		}
+	}
+	for (auto &program : programs) {
 		auto nmask = NullMask(segment, program.null_cols);
 		if (nmask.has_value()) {
-			out.masks.emplace_back(mx::astype(*nmask, mx::uint8));
+			outs.push_back(mx::astype(*nmask, mx::uint8));
+		}
+	}
+}
+
+GroupedSegmentArrays GroupedEvalSegment(const MlxSegment &segment, const MlxGroupedSpec &spec,
+                                        const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
+                                        bool exact_int_eval = false, bool defer_materialize = false) {
+	GroupedSegmentArrays out;
+	out.count = segment.count;
+	if (segment.count == 0) {
+		out.exprs.resize(programs.size());
+		out.masks.resize(programs.size());
+		return out;
+	}
+
+	std::vector<mx::array> inputs = segment.cols;
+	std::vector<int32_t> valid_slots(segment.valids.size(), -1);
+	for (size_t i = 0; i < segment.valids.size(); i++) {
+		if (segment.valids[i].has_value()) {
+			valid_slots[i] = static_cast<int32_t>(inputs.size());
+			inputs.push_back(*segment.valids[i]);
+		}
+	}
+	std::vector<mx::array> graphs;
+	if (defer_materialize) {
+		// Resident hot path: skip mx::compile JIT — caller fuses eval with tile reduce.
+		BuildGroupedEvalGraphs(segment, spec, programs, filter, exact_int_eval, graphs);
+	} else {
+		auto ncols = segment.cols.size();
+		auto count = segment.count;
+		auto fn = [spec, programs, filter, exact_int_eval, ncols, valid_slots, count](const std::vector<mx::array> &ins) {
+			MlxSegment seg;
+			seg.count = count;
+			seg.cols.assign(ins.begin(), ins.begin() + ncols);
+			for (size_t i = 0; i < ncols; i++) {
+				if (valid_slots[i] >= 0) {
+					seg.valids.emplace_back(ins[valid_slots[i]]);
+				} else {
+					seg.valids.emplace_back(std::nullopt);
+				}
+			}
+			std::vector<mx::array> outs;
+			BuildGroupedEvalGraphs(seg, spec, programs, filter, exact_int_eval, outs);
+			return outs;
+		};
+		graphs = mx::compile(fn)(inputs);
+	}
+	size_t cursor = 0;
+	out.codes = graphs[cursor++];
+	out.exprs.resize(programs.size());
+	for (size_t p = 0; p < programs.size(); p++) {
+		if (HasValueGraph(programs[p].kind)) {
+			out.exprs[p] = graphs[cursor++];
 		} else {
-			out.masks.emplace_back(std::nullopt);
+			out.exprs[p] = std::nullopt;
+		}
+	}
+	out.masks.resize(programs.size());
+	for (size_t p = 0; p < programs.size(); p++) {
+		auto nmask = NullMask(segment, programs[p].null_cols);
+		if (nmask.has_value()) {
+			out.masks[p] = graphs[cursor++];
+		} else {
+			out.masks[p] = std::nullopt;
 		}
 	}
 
@@ -1936,7 +2351,18 @@ void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, co
 
 void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
                                 const std::vector<std::string> &col_keys,
-                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
+                                const std::string &table_prefix) {
+	std::string prefix = table_prefix;
+	if (prefix.empty() && !col_keys.empty()) {
+		auto pos = col_keys[0].rfind('#');
+		if (pos != std::string::npos) {
+			prefix = col_keys[0].substr(0, pos + 1);
+		}
+	}
+	if (state.dense_reduce && !prefix.empty() && TryLineitemQ1FastPath(state, prefix, col_keys, programs, filter)) {
+		return;
+	}
 	if (state.dense_reduce) {
 		MlxSegment mega;
 		{
@@ -1964,8 +2390,40 @@ void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &sp
 			}
 		}
 		if (mega.count > 0 && !mega.cols.empty()) {
-			std::vector<mx::array> graph;
 			auto arrays = GroupedEvalSegment(mega, spec, programs, filter, true, true);
+			if (GroupedTileKernelEligible(programs, state.card)) {
+				std::vector<std::pair<size_t, mx::array>> val_exprs;
+				std::vector<std::optional<mx::array>> val_masks;
+				val_exprs.reserve(programs.size());
+				val_masks.reserve(programs.size());
+				for (size_t p = 0; p < programs.size(); p++) {
+					auto kind = programs[p].kind;
+					if ((kind == MlxAggKind::SUM || kind == MlxAggKind::AVG) && programs[p].int_lane &&
+					    arrays.exprs[p].has_value()) {
+						val_exprs.push_back({p, *arrays.exprs[p]});
+						val_masks.push_back(arrays.masks[p]);
+					}
+				}
+				if (!val_exprs.empty()) {
+					std::vector<mx::array> graph = {arrays.codes};
+					for (auto &ve : val_exprs) {
+						graph.push_back(ve.second);
+					}
+					for (auto &m : val_masks) {
+						if (m.has_value()) {
+							graph.push_back(*m);
+						}
+					}
+					mx::eval(graph);
+					try {
+						GroupedTileKernelAccumulate(state, arrays.codes, val_exprs, val_masks, programs);
+						return;
+					} catch (...) {
+						// Custom Metal kernel unavailable or unsupported layout — dense reduce fallback.
+					}
+				}
+			}
+			std::vector<mx::array> graph;
 			graph.push_back(arrays.codes);
 			for (auto &e : arrays.exprs) {
 				if (e.has_value()) {

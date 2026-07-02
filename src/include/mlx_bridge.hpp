@@ -199,6 +199,19 @@ void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &co
 //! Fuse per-segment cache slices into contiguous GPU-resident columns (call after pin).
 void MlxCacheFuseTable(const std::string &table_prefix);
 
+//! Pin-time derived columns (unified-memory tier): evaluate expression forests once
+//! over fused base columns and register fingerprints for query-time LOAD_COL rewrite.
+void MlxCacheMaterializeDerived(const std::string &table_prefix, const std::string &derived_suffix,
+                                const std::vector<std::string> &base_col_keys, const std::vector<MlxExprOp> &ops);
+//! TPC-H lineitem hot expressions (extendedprice*(1-discount), charge) + Q1 fast-path bundle.
+void MlxCacheMaterializeLineitemTpch(const std::string &table_prefix, int col_extendedprice, int col_discount,
+                                     int col_tax, int64_t decimal_one_scaled);
+void MlxCacheMaterializeLineitemQ1(const std::string &table_prefix, int col_shipdate, int col_returnflag,
+                                   int col_linestatus, int col_quantity, int col_extendedprice, int col_discount);
+//! Rewrite program value graphs to resident derived columns when fingerprints match.
+size_t MlxCacheBindDerivedPrograms(const std::string &table_prefix, std::vector<std::string> &col_keys,
+                                 std::vector<MlxSumProgram> &programs);
+
 //! Evaluates aggregate programs over cached columns, entirely GPU-resident.
 //! Partition-level zone maps prune segments before kernel launch when the WHERE
 //! clause is a conjunction of column-vs-constant comparisons.
@@ -273,7 +286,8 @@ void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, co
 //! positions used by the programs and spec).
 void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
                                 const std::vector<std::string> &col_keys,
-                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
+                                const std::string &table_prefix = "");
 
 //! Download GPU scatter accumulators into `state` and release GPU resources.
 void MlxGroupedGpuFinish(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs);

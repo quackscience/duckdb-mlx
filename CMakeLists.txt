@@ -62,7 +62,7 @@ target_link_libraries(duckdb_mlx_logger PRIVATE spdlog::spdlog)
 # src/bridge/ isolates MLX the same way: MLX headers and DuckDB headers never
 # meet in one translation unit; data crosses as raw pointers (unified memory).
 if(DUCKDB_MLX_ENABLE_GPU)
-  add_library(duckdb_mlx_bridge STATIC src/bridge/mlx_bridge.cpp src/bridge/mlx_groupby.cpp)
+  add_library(duckdb_mlx_bridge STATIC src/bridge/mlx_bridge.cpp src/bridge/mlx_groupby.cpp src/bridge/mlx_grouped_kernel.cpp)
   set_target_properties(
     duckdb_mlx_bridge PROPERTIES INCLUDE_DIRECTORIES "" CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
                                  POSITION_INDEPENDENT_CODE ON)

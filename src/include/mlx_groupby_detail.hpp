@@ -25,4 +25,14 @@ bool MlxGroupbyDenseTryRead(const std::string &group_col_key, const std::string 
 
 void MlxGroupbyDenseClearTable(const std::string &table_prefix);
 
+bool GroupedTileKernelEligible(const std::vector<MlxSumProgram> &programs, int64_t card);
+void GroupedTileKernelAccumulate(MlxGroupedState &state, const mlx::core::array &codes,
+                                 const std::vector<std::pair<size_t, mlx::core::array>> &val_exprs,
+                                 const std::vector<std::optional<mlx::core::array>> &val_masks,
+                                 const std::vector<MlxSumProgram> &programs);
+void GroupedPackedTileAccumulate(MlxGroupedState &state, const mlx::core::array &codes, const mlx::core::array &pass,
+                                 const mlx::core::array &packed, int val_n,
+                                 const std::vector<std::pair<size_t, int>> &val_slots,
+                                 const std::vector<MlxSumProgram> &programs);
+
 } // namespace duckdb_mlx
