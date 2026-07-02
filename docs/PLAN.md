@@ -7,6 +7,26 @@
 
 ## 0. Progress Log
 
+### 2026-07-02 (later) — Phase 1 shipped: transparent 14× via GPU-resident cache + fusion
+
+- `OptimizerExtension` intercepts `AGGREGATE(SUM(expr)) ← [PROJECTION] ← SEQ_SCAN`
+  (expressions: arithmetic, negate, sin/cos/sqrt/abs, casts, constants over
+  DOUBLE/FLOAT/BIGINT/INTEGER; everything else declines untouched).
+- **GPU-resident column cache** (§3.2 realized): first query populates fp32 column
+  segments keyed `catalog.schema.table#col`; subsequent plans become `MLX_SUM_CACHED`,
+  a pure source with **no table scan**. Row-count mismatch bypasses + repopulates.
+  Populations are all-or-nothing per table so multi-column programs stay row-aligned.
+- **Kernel fusion**: each segment's expression forest goes through `mx::compile`
+  (§ "where the speedup comes from" #2 confirmed): unfused 70 ms → fused 13 ms.
+  Gotcha: constant-valued outputs corrupt `mx::compile`'s output mapping — keep them
+  host-side.
+- **Measured (M4 base, 100M rows, hot)**: expression SUM 190 ms → 13 ms (**14×**);
+  `sum(x)` 13 ms → 4 ms (fp32 bandwidth floor); cold 0.49 s; CPU nearly idle during GPU
+  queries. 80 differential/fallback assertions green.
+- Next: wider coverage on the same machinery (FILTER → masked sums, more aggregates
+  (count/avg/min/max), GROUP BY via Tier-B kernels), cache eviction/memory budget,
+  and the custom top-k kernel for VSS batches.
+
 ### 2026-07-02 — Phase 0 complete + flagship use-case
 
 **Done, all test-gated (26 sqllogictest assertions passing):**

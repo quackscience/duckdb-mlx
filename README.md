@@ -8,10 +8,28 @@ roadmap; the design ports concepts from NVIDIA GQE and Sirius, re-derived for un
 memory. Progress is test-gated: every capability lands with a passing differential test
 against DuckDB's own CPU results before it is committed.
 
-**Status:** Phase 0 complete — MLX runs inside the extension, data flows DuckDB → GPU →
-DuckDB, and the first flagship use-case (GPU-resident vector similarity search) is
-working, tested, and benchmarked. The transparent optimizer hook (plain SQL silently
-accelerated) is the next phase.
+**Status:** Transparent GPU acceleration is live. An optimizer hook intercepts supported
+plans, and a GPU-resident column cache (the GQE "in-memory table format", unified-memory
+edition) serves repeated queries with **no table scan at all**, fused into a few Metal
+kernels by `mx::compile`.
+
+## Headline: plain SQL, 14× (base M4, 100M rows, hot cache)
+
+```sql
+LOAD 'duckdb_mlx';
+SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;  -- that's it. no special syntax.
+```
+
+| Query (100M rows) | DuckDB CPU (all cores) | duckdb-mlx GPU (hot) | Speedup |
+|---|---|---|---|
+| `sum(sin(x)*cos(x)+sqrt(abs(x)+1))` | 190 ms | **13 ms** | **14×** |
+| `sum(x)` | 13 ms | **4 ms** | 3.3× (fp32 bandwidth limit) |
+
+First run over a table is cold (~0.5 s: scan + GPU cache build), then the columns stay
+GPU-resident; row-count changes invalidate and repopulate automatically. During hot GPU
+queries the CPU does ~1 ms of work versus 1.6 CPU-seconds on the CPU engine. Every result
+is verified against DuckDB's own engine by the differential test suite. Reproduce with
+`benchmark/bench_transparent.sql`.
 
 ## Flagship: GPU-resident vector search
 
