@@ -1,0 +1,96 @@
+# name: test/sql/mlx_decimal.test
+# description: exact DECIMAL int64 lane + DATE filters (TPC-H Q6 shape)
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+CREATE TABLE td AS
+SELECT (((range * 7919) % 100000) / 100.0)::DECIMAL(15,2) AS price,
+       (((range * 13) % 11) / 100.0)::DECIMAL(15,2) AS disc,
+       ((range % 50) + 1)::DECIMAL(15,2) AS qty,
+       (DATE '1992-01-01' + INTERVAL (range % 2500) DAY)::DATE AS ship
+FROM range(2000000);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+# Q6 shape intercepts (decimal arithmetic, date + decimal pushed filters)
+query II
+EXPLAIN SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24;
+----
+physical_plan	<REGEX>:.*MLX_SUM.*
+
+# exact equality with the CPU engine — decimals must match to the last digit
+statement ok
+SET VARIABLE gpu_q6 = (SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
+
+statement ok
+SET VARIABLE gpu_aggs = (SELECT [min(price)::VARCHAR, max(price)::VARCHAR, sum(qty)::VARCHAR,
+                                 avg(price)::VARCHAR, count(qty)::VARCHAR] FROM td WHERE disc >= 0.05);
+
+# hot run serves from the cache
+query II
+EXPLAIN SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+statement ok
+SET VARIABLE gpu_q6_hot = (SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
+
+statement ok
+SET mlx_execution = false;
+
+query I
+SELECT getvariable('gpu_q6') = (SELECT sum(price * disc) FROM td
+WHERE ship >= DATE '1994-01-01' AND ship < DATE '1995-01-01'
+  AND disc BETWEEN 0.05 AND 0.07 AND qty < 24);
+----
+true
+
+query I
+SELECT getvariable('gpu_q6_hot') = getvariable('gpu_q6');
+----
+true
+
+query I
+SELECT getvariable('gpu_aggs') = (SELECT [min(price)::VARCHAR, max(price)::VARCHAR, sum(qty)::VARCHAR,
+                                          avg(price)::VARCHAR, count(qty)::VARCHAR] FROM td WHERE disc >= 0.05);
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# int64 overflow risk declines to the CPU (values near 1e17, exact answer preserved)
+statement ok
+CREATE TABLE tbig AS SELECT (99999999999999999)::DECIMAL(18,0) AS big FROM range(2000000);
+
+query II
+EXPLAIN SELECT sum(big) FROM tbig;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# NULL decimals honor SQL semantics through the validity lane
+statement ok
+CREATE TABLE tnul AS
+SELECT CASE WHEN range % 3 = 0 THEN NULL ELSE (range % 1000)::DECIMAL(15,2) END AS d FROM range(2000000);
+
+statement ok
+SET VARIABLE gpu_nul = (SELECT [sum(d)::VARCHAR, count(d)::VARCHAR] FROM tnul WHERE d > 10.5);
+
+statement ok
+SET mlx_execution = false;
+
+query I
+SELECT getvariable('gpu_nul') = (SELECT [sum(d)::VARCHAR, count(d)::VARCHAR] FROM tnul WHERE d > 10.5);
+----
+true

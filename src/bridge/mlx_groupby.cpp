@@ -74,6 +74,9 @@ uint32_t NextPow2(uint32_t x) {
 }
 
 mx::array KeysFromCacheColumn(const mx::array &col) {
+	if (col.dtype() == mx::int64) {
+		return col;
+	}
 	return mx::astype(mx::round(col), mx::int64);
 }
 

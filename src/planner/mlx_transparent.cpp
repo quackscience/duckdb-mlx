@@ -61,24 +61,53 @@ struct MlxExprTranslator {
 	vector<MlxExprOp> ops;
 	std::set<int32_t> referenced_cols;
 
+	enum class Lane : uint8_t { FLOAT_LANE, INT_LANE, BOOL_LANE };
+
+	//! DECIMAL(<=18) evaluates exactly in the int64 lane as raw scaled integers
+	static bool IsIntLaneType(const LogicalType &type) {
+		return type.id() == LogicalTypeId::DECIMAL && type.InternalType() != PhysicalType::INT128;
+	}
+
 	static bool IsSupportedColumnType(const LogicalType &type) {
 		switch (type.id()) {
 		case LogicalTypeId::DOUBLE:
 		case LogicalTypeId::FLOAT:
 		case LogicalTypeId::BIGINT:
 		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::DATE: // epoch days ride the fp32 lane exactly (< 2^24)
 			return true;
+		case LogicalTypeId::DECIMAL:
+			return IsIntLaneType(type);
 		default:
 			return false;
 		}
 	}
 
-	bool Translate(const Expression &expr) {
+	static int64_t DecimalRaw(const Value &value) {
+		switch (value.type().InternalType()) {
+		case PhysicalType::INT16:
+			return value.GetValueUnsafe<int16_t>();
+		case PhysicalType::INT32:
+			return value.GetValueUnsafe<int32_t>();
+		default:
+			return value.GetValueUnsafe<int64_t>();
+		}
+	}
+
+	static int64_t Pow10(uint8_t exponent) {
+		int64_t result = 1;
+		for (uint8_t i = 0; i < exponent; i++) {
+			result *= 10;
+		}
+		return result;
+	}
+
+	bool Translate(const Expression &expr, Lane &lane) {
 		switch (expr.GetExpressionClass()) {
 		case ExpressionClass::BOUND_COLUMN_REF: {
 			auto &colref = expr.Cast<BoundColumnRefExpression>();
 			if (proj && colref.binding.table_index == proj->table_index) {
-				return Translate(*proj->expressions[colref.binding.column_index]);
+				return Translate(*proj->expressions[colref.binding.column_index], lane);
 			}
 			if (colref.binding.table_index != get.table_index) {
 				return false;
@@ -94,14 +123,37 @@ struct MlxExprTranslator {
 			auto storage_col = NumericCast<int32_t>(column_ids[col_idx].GetPrimaryIndex());
 			ops.push_back({MlxExprOpCode::LOAD_COL, storage_col, 0});
 			referenced_cols.insert(storage_col);
+			lane = IsIntLaneType(colref.return_type) ? Lane::INT_LANE : Lane::FLOAT_LANE;
 			return true;
 		}
 		case ExpressionClass::BOUND_CONSTANT: {
 			auto &constant = expr.Cast<BoundConstantExpression>();
-			if (constant.value.IsNull() || !constant.value.type().IsNumeric()) {
+			if (constant.value.IsNull()) {
+				return false;
+			}
+			auto &type = constant.value.type();
+			if (type.id() == LogicalTypeId::DECIMAL) {
+				if (!IsIntLaneType(type)) {
+					return false;
+				}
+				MlxExprOp op {MlxExprOpCode::CONST_VAL, 0, 0};
+				op.ivalue = DecimalRaw(constant.value);
+				op.int_lane = true;
+				ops.push_back(op);
+				lane = Lane::INT_LANE;
+				return true;
+			}
+			if (type.id() == LogicalTypeId::DATE) {
+				ops.push_back(
+				    {MlxExprOpCode::CONST_VAL, 0, static_cast<double>(constant.value.GetValue<date_t>().days)});
+				lane = Lane::FLOAT_LANE;
+				return true;
+			}
+			if (!type.IsNumeric()) {
 				return false;
 			}
 			ops.push_back({MlxExprOpCode::CONST_VAL, 0, constant.value.GetValue<double>()});
+			lane = Lane::FLOAT_LANE;
 			return true;
 		}
 		case ExpressionClass::BOUND_CAST: {
@@ -109,14 +161,56 @@ struct MlxExprTranslator {
 			if (cast.try_cast) {
 				return false;
 			}
-			// numeric -> DOUBLE/FLOAT casts are implicit in the fp32 pipeline
-			if (cast.return_type.id() != LogicalTypeId::DOUBLE && cast.return_type.id() != LogicalTypeId::FLOAT) {
+			auto &to = cast.return_type;
+			auto &from = cast.child->return_type;
+			if (to.id() == LogicalTypeId::DECIMAL && from.id() == LogicalTypeId::DECIMAL) {
+				// widening rescale = exact integer multiply by 10^k
+				if (!IsIntLaneType(to) || !IsIntLaneType(from)) {
+					return false;
+				}
+				auto k = static_cast<int>(DecimalType::GetScale(to)) - static_cast<int>(DecimalType::GetScale(from));
+				if (k < 0) {
+					return false;
+				}
+				Lane child_lane;
+				if (!Translate(*cast.child, child_lane) || child_lane != Lane::INT_LANE) {
+					return false;
+				}
+				if (k > 0) {
+					MlxExprOp op {MlxExprOpCode::CONST_VAL, 0, 0};
+					op.ivalue = Pow10(NumericCast<uint8_t>(k));
+					op.int_lane = true;
+					ops.push_back(op);
+					ops.push_back({MlxExprOpCode::MUL, 0, 0});
+				}
+				lane = Lane::INT_LANE;
+				return true;
+			}
+			if (to.id() != LogicalTypeId::DOUBLE && to.id() != LogicalTypeId::FLOAT) {
 				return false;
 			}
-			if (!cast.child->return_type.IsNumeric()) {
+			if (from.id() == LogicalTypeId::DECIMAL) {
+				if (!IsIntLaneType(from)) {
+					return false;
+				}
+				Lane child_lane;
+				if (!Translate(*cast.child, child_lane) || child_lane != Lane::INT_LANE) {
+					return false;
+				}
+				auto scale = DecimalType::GetScale(from);
+				ops.push_back({MlxExprOpCode::TO_FLOAT, 0, 1.0 / static_cast<double>(Pow10(scale))});
+				lane = Lane::FLOAT_LANE;
+				return true;
+			}
+			if (!from.IsNumeric()) {
 				return false;
 			}
-			return Translate(*cast.child);
+			Lane child_lane;
+			if (!Translate(*cast.child, child_lane) || child_lane != Lane::FLOAT_LANE) {
+				return false;
+			}
+			lane = Lane::FLOAT_LANE;
+			return true;
 		}
 		case ExpressionClass::BOUND_COMPARISON: {
 			auto &comparison = expr.Cast<BoundComparisonExpression>();
@@ -143,25 +237,33 @@ struct MlxExprTranslator {
 			default:
 				return false;
 			}
-			if (!Translate(*comparison.left) || !Translate(*comparison.right)) {
+			Lane left_lane;
+			Lane right_lane;
+			if (!Translate(*comparison.left, left_lane) || !Translate(*comparison.right, right_lane)) {
+				return false;
+			}
+			if (left_lane != right_lane || left_lane == Lane::BOOL_LANE) {
 				return false;
 			}
 			ops.push_back({code, 0, 0});
+			lane = Lane::BOOL_LANE;
 			return true;
 		}
 		case ExpressionClass::BOUND_CONJUNCTION: {
 			auto &conjunction = expr.Cast<BoundConjunctionExpression>();
 			auto code =
 			    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? MlxExprOpCode::AND : MlxExprOpCode::OR;
-			if (!Translate(*conjunction.children[0])) {
+			Lane child_lane;
+			if (!Translate(*conjunction.children[0], child_lane) || child_lane != Lane::BOOL_LANE) {
 				return false;
 			}
 			for (idx_t i = 1; i < conjunction.children.size(); i++) {
-				if (!Translate(*conjunction.children[i])) {
+				if (!Translate(*conjunction.children[i], child_lane) || child_lane != Lane::BOOL_LANE) {
 					return false;
 				}
 				ops.push_back({code, 0, 0});
 			}
+			lane = Lane::BOOL_LANE;
 			return true;
 		}
 		case ExpressionClass::BOUND_OPERATOR: {
@@ -169,10 +271,12 @@ struct MlxExprTranslator {
 			if (expr.GetExpressionType() != ExpressionType::OPERATOR_NOT || op.children.size() != 1) {
 				return false;
 			}
-			if (!Translate(*op.children[0])) {
+			Lane child_lane;
+			if (!Translate(*op.children[0], child_lane) || child_lane != Lane::BOOL_LANE) {
 				return false;
 			}
 			ops.push_back({MlxExprOpCode::NOT, 0, 0});
+			lane = Lane::BOOL_LANE;
 			return true;
 		}
 		case ExpressionClass::BOUND_FUNCTION: {
@@ -191,31 +295,49 @@ struct MlxExprTranslator {
 				} else {
 					return false;
 				}
-				if (!Translate(*function.children[0]) || !Translate(*function.children[1])) {
+				Lane left_lane;
+				Lane right_lane;
+				if (!Translate(*function.children[0], left_lane) || !Translate(*function.children[1], right_lane)) {
 					return false;
 				}
+				if (left_lane != right_lane || left_lane == Lane::BOOL_LANE) {
+					return false;
+				}
+				if (left_lane == Lane::INT_LANE && code == MlxExprOpCode::DIV) {
+					return false; // integer division truncates; the CPU handles it
+				}
 				ops.push_back({code, 0, 0});
+				lane = left_lane;
 				return true;
 			}
 			if (function.children.size() == 1) {
 				MlxExprOpCode code;
+				bool float_only = false;
 				if (name == "-") {
 					code = MlxExprOpCode::NEGATE;
 				} else if (name == "sin") {
 					code = MlxExprOpCode::SIN;
+					float_only = true;
 				} else if (name == "cos") {
 					code = MlxExprOpCode::COS;
+					float_only = true;
 				} else if (name == "sqrt") {
 					code = MlxExprOpCode::SQRT;
+					float_only = true;
 				} else if (name == "abs") {
 					code = MlxExprOpCode::ABS;
 				} else {
 					return false;
 				}
-				if (!Translate(*function.children[0])) {
+				Lane child_lane;
+				if (!Translate(*function.children[0], child_lane) || child_lane == Lane::BOOL_LANE) {
+					return false;
+				}
+				if (float_only && child_lane != Lane::FLOAT_LANE) {
 					return false;
 				}
 				ops.push_back({code, 0, 0});
+				lane = child_lane;
 				return true;
 			}
 			return false;
@@ -226,14 +348,14 @@ struct MlxExprTranslator {
 	}
 };
 
-template <class T>
-static void AppendMlxColumn(UnifiedVectorFormat &fmt, idx_t count, vector<float> &values, vector<uint8_t> &valid) {
+template <class T, class OUT>
+static void AppendMlxColumnT(UnifiedVectorFormat &fmt, idx_t count, vector<OUT> &values, vector<uint8_t> &valid) {
 	auto data = UnifiedVectorFormat::GetData<T>(fmt);
 	auto base = values.size();
 	values.resize(base + count);
 	if (!fmt.sel->IsSet() && fmt.validity.AllValid()) {
 		for (idx_t i = 0; i < count; i++) {
-			values[base + i] = static_cast<float>(data[i]);
+			values[base + i] = static_cast<OUT>(data[i]);
 		}
 		if (!valid.empty()) {
 			valid.resize(base + count, 1);
@@ -247,10 +369,52 @@ static void AppendMlxColumn(UnifiedVectorFormat &fmt, idx_t count, vector<float>
 	for (idx_t i = 0; i < count; i++) {
 		auto idx = fmt.sel->get_index(i);
 		bool row_valid = fmt.validity.RowIsValid(idx);
-		values[base + i] = row_valid ? static_cast<float>(data[idx]) : 0.0f;
+		values[base + i] = row_valid ? static_cast<OUT>(data[idx]) : static_cast<OUT>(0);
 		if (!row_valid) {
 			valid[base + i] = 0;
 		}
+	}
+}
+
+template <class T>
+static void AppendMlxColumn(UnifiedVectorFormat &fmt, idx_t count, vector<float> &values, vector<uint8_t> &valid) {
+	AppendMlxColumnT<T, float>(fmt, count, values, valid);
+}
+
+//! Buffers one column into the lane its type dictates: DECIMAL(<=18) raw into
+//! int64 (exact lane), DATE as epoch days and other numerics into fp32.
+static bool AppendLaneColumn(const LogicalType &type, UnifiedVectorFormat &fmt, idx_t count, vector<float> &values,
+                             vector<int64_t> &ivalues, vector<uint8_t> &valid) {
+	switch (type.id()) {
+	case LogicalTypeId::DOUBLE:
+		AppendMlxColumnT<double, float>(fmt, count, values, valid);
+		return true;
+	case LogicalTypeId::FLOAT:
+		AppendMlxColumnT<float, float>(fmt, count, values, valid);
+		return true;
+	case LogicalTypeId::BIGINT:
+		AppendMlxColumnT<int64_t, float>(fmt, count, values, valid);
+		return true;
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::DATE: // physical int32 epoch days
+		AppendMlxColumnT<int32_t, float>(fmt, count, values, valid);
+		return true;
+	case LogicalTypeId::DECIMAL:
+		switch (type.InternalType()) {
+		case PhysicalType::INT16:
+			AppendMlxColumnT<int16_t, int64_t>(fmt, count, ivalues, valid);
+			return true;
+		case PhysicalType::INT32:
+			AppendMlxColumnT<int32_t, int64_t>(fmt, count, ivalues, valid);
+			return true;
+		case PhysicalType::INT64:
+			AppendMlxColumnT<int64_t, int64_t>(fmt, count, ivalues, valid);
+			return true;
+		default:
+			return false;
+		}
+	default:
+		return false;
 	}
 }
 
@@ -300,6 +464,7 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 	// would mean thousands of tiny GPU graphs per hot query
 	constexpr idx_t kWarmSegmentRows = 8 * 1024 * 1024;
 	vector<vector<float>> values(types.size());
+	vector<vector<int64_t>> ivalues(types.size());
 	vector<vector<uint8_t>> valid(types.size());
 	idx_t buffered = 0;
 
@@ -309,11 +474,19 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 		}
 		vector<MlxColumnData> cols;
 		for (idx_t col = 0; col < values.size(); col++) {
-			cols.push_back({values[col].data(), valid[col].empty() ? nullptr : valid[col].data()});
+			MlxColumnData data;
+			data.valid = valid[col].empty() ? nullptr : valid[col].data();
+			if (!ivalues[col].empty()) {
+				data.ivalues = ivalues[col].data();
+			} else {
+				data.values = values[col].data();
+			}
+			cols.push_back(data);
 		}
 		duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, buffered);
 		for (idx_t col = 0; col < values.size(); col++) {
 			values[col].clear();
+			ivalues[col].clear();
 			valid[col].clear();
 		}
 		buffered = 0;
@@ -329,20 +502,7 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 			UnifiedVectorFormat fmt;
 			chunk.data[col].ToUnifiedFormat(count, fmt);
-			switch (chunk.data[col].GetType().id()) {
-			case LogicalTypeId::DOUBLE:
-				AppendMlxColumn<double>(fmt, count, values[col], valid[col]);
-				break;
-			case LogicalTypeId::FLOAT:
-				AppendMlxColumn<float>(fmt, count, values[col], valid[col]);
-				break;
-			case LogicalTypeId::BIGINT:
-				AppendMlxColumn<int64_t>(fmt, count, values[col], valid[col]);
-				break;
-			case LogicalTypeId::INTEGER:
-				AppendMlxColumn<int32_t>(fmt, count, values[col], valid[col]);
-				break;
-			default:
+			if (!AppendLaneColumn(chunk.data[col].GetType(), fmt, count, values[col], ivalues[col], valid[col])) {
 				return; // unsupported column type: leave the cache unwarmed
 			}
 		}
@@ -364,8 +524,34 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 //! so combining never re-copies the data.
 struct MlxSumSegment {
 	vector<vector<float>> values;
+	vector<vector<int64_t>> ivalues; // int64 lane (DECIMAL raw)
 	vector<vector<uint8_t>> valid;
 };
+
+static size_t SegmentRowCount(const MlxSumSegment &segment) {
+	for (idx_t col = 0; col < segment.values.size(); col++) {
+		if (!segment.values[col].empty()) {
+			return segment.values[col].size();
+		}
+		if (!segment.ivalues[col].empty()) {
+			return segment.ivalues[col].size();
+		}
+	}
+	return 0;
+}
+
+static void SegmentColumns(const MlxSumSegment &segment, vector<duckdb_mlx::MlxColumnData> &cols) {
+	for (idx_t col = 0; col < segment.values.size(); col++) {
+		duckdb_mlx::MlxColumnData data;
+		data.valid = segment.valid[col].empty() ? nullptr : segment.valid[col].data();
+		if (!segment.ivalues[col].empty()) {
+			data.ivalues = segment.ivalues[col].data();
+		} else {
+			data.values = segment.values[col].data();
+		}
+		cols.push_back(data);
+	}
+}
 
 class MlxSumLocalSinkState : public LocalSinkState {
 public:
@@ -432,28 +618,15 @@ public:
 		auto &segment = input.local_state.Cast<MlxSumLocalSinkState>().segment;
 		if (segment.values.empty()) {
 			segment.values.resize(chunk.ColumnCount());
+			segment.ivalues.resize(chunk.ColumnCount());
 			segment.valid.resize(chunk.ColumnCount()); // stays empty per column until a NULL appears
 		}
 		auto count = chunk.size();
 		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 			UnifiedVectorFormat fmt;
 			chunk.data[col].ToUnifiedFormat(count, fmt);
-			auto &values = segment.values[col];
-			auto &valid = segment.valid[col];
-			switch (chunk.data[col].GetType().id()) {
-			case LogicalTypeId::DOUBLE:
-				AppendMlxColumn<double>(fmt, count, values, valid);
-				break;
-			case LogicalTypeId::FLOAT:
-				AppendMlxColumn<float>(fmt, count, values, valid);
-				break;
-			case LogicalTypeId::BIGINT:
-				AppendMlxColumn<int64_t>(fmt, count, values, valid);
-				break;
-			case LogicalTypeId::INTEGER:
-				AppendMlxColumn<int32_t>(fmt, count, values, valid);
-				break;
-			default:
+			if (!AppendLaneColumn(chunk.data[col].GetType(), fmt, count, segment.values[col], segment.ivalues[col],
+			                      segment.valid[col])) {
 				throw InternalException("MLX_SUM: unexpected column type at execution time");
 			}
 		}
@@ -480,11 +653,8 @@ public:
 			auto plan = duckdb_mlx::MlxCacheBeginPopulation(table_prefix, col_keys, expected_rows);
 			for (auto &segment : gstate.segments) {
 				vector<MlxColumnData> cols;
-				size_t row_count = segment.values.empty() ? 0 : segment.values[0].size();
-				for (idx_t col = 0; col < segment.values.size(); col++) {
-					cols.push_back(
-					    {segment.values[col].data(), segment.valid[col].empty() ? nullptr : segment.valid[col].data()});
-				}
+				size_t row_count = SegmentRowCount(segment);
+				SegmentColumns(segment, cols);
 				duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, row_count);
 			}
 			duckdb_mlx::MlxFilter no_filter;
@@ -496,39 +666,43 @@ public:
 		for (auto &program : programs) {
 			switch (program.kind) {
 			case MlxAggKind::MIN:
-				gstate.results.push_back({std::numeric_limits<double>::infinity(), 0});
+				gstate.results.push_back(
+				    {std::numeric_limits<double>::infinity(), 0, std::numeric_limits<int64_t>::max()});
 				break;
 			case MlxAggKind::MAX:
-				gstate.results.push_back({-std::numeric_limits<double>::infinity(), 0});
+				gstate.results.push_back(
+				    {-std::numeric_limits<double>::infinity(), 0, std::numeric_limits<int64_t>::min()});
 				break;
 			default:
-				gstate.results.push_back({0.0, 0});
+				gstate.results.push_back({0.0, 0, 0});
 				break;
 			}
 		}
 		duckdb_mlx::MlxFilter no_filter;
 		for (auto &segment : gstate.segments) {
 			vector<MlxColumnData> cols;
-			size_t row_count = segment.values.empty() ? 0 : segment.values[0].size();
-			for (idx_t col = 0; col < segment.values.size(); col++) {
-				cols.push_back(
-				    {segment.values[col].data(), segment.valid[col].empty() ? nullptr : segment.valid[col].data()});
-			}
+			size_t row_count = SegmentRowCount(segment);
+			SegmentColumns(segment, cols);
 			auto partial = duckdb_mlx::MlxSumExprs(cols, row_count, programs, no_filter);
 			for (idx_t i = 0; i < programs.size(); i++) {
 				switch (programs[i].kind) {
 				case MlxAggKind::MIN:
 					gstate.results[i].value = MinValue(gstate.results[i].value, partial[i].value);
+					gstate.results[i].ivalue = MinValue(gstate.results[i].ivalue, partial[i].ivalue);
 					break;
 				case MlxAggKind::MAX:
 					gstate.results[i].value = MaxValue(gstate.results[i].value, partial[i].value);
+					gstate.results[i].ivalue = MaxValue(gstate.results[i].ivalue, partial[i].ivalue);
 					break;
 				case MlxAggKind::AVG:
-					// re-weight the per-segment average into a running sum
+					// re-weight the per-segment average into a running sum;
+					// int-lane averages accumulate exactly through ivalue
 					gstate.results[i].value += partial[i].value * static_cast<double>(partial[i].valid_count);
+					gstate.results[i].ivalue += partial[i].ivalue;
 					break;
 				default:
 					gstate.results[i].value += partial[i].value;
+					gstate.results[i].ivalue += partial[i].ivalue;
 					break;
 				}
 				gstate.results[i].valid_count += partial[i].valid_count;
@@ -536,7 +710,9 @@ public:
 		}
 		for (idx_t i = 0; i < programs.size(); i++) {
 			if (programs[i].kind == MlxAggKind::AVG && gstate.results[i].valid_count > 0) {
-				gstate.results[i].value /= static_cast<double>(gstate.results[i].valid_count);
+				auto count = static_cast<double>(gstate.results[i].valid_count);
+				gstate.results[i].value = programs[i].int_lane ? static_cast<double>(gstate.results[i].ivalue) / count
+				                                               : gstate.results[i].value / count;
 			}
 		}
 		if (skip_cache_populate) {
@@ -571,8 +747,24 @@ public:
 				FlatVector::GetData<int64_t>(chunk.data[i])[0] = results[i].valid_count;
 			} else if (results[i].valid_count == 0) {
 				FlatVector::Validity(chunk.data[i]).SetInvalid(0);
+			} else if (programs[i].int_lane && types[i].id() == LogicalTypeId::DECIMAL) {
+				// exact raw-scaled integer result
+				switch (types[i].InternalType()) {
+				case PhysicalType::INT128:
+					FlatVector::GetData<hugeint_t>(chunk.data[i])[0] = hugeint_t(results[i].ivalue);
+					break;
+				case PhysicalType::INT64:
+					FlatVector::GetData<int64_t>(chunk.data[i])[0] = results[i].ivalue;
+					break;
+				case PhysicalType::INT32:
+					FlatVector::GetData<int32_t>(chunk.data[i])[0] = NumericCast<int32_t>(results[i].ivalue);
+					break;
+				default:
+					FlatVector::GetData<int16_t>(chunk.data[i])[0] = NumericCast<int16_t>(results[i].ivalue);
+					break;
+				}
 			} else {
-				FlatVector::GetData<double>(chunk.data[i])[0] = results[i].value;
+				FlatVector::GetData<double>(chunk.data[i])[0] = results[i].value * programs[i].render_scale;
 			}
 		}
 		chunk.SetCardinality(1);
@@ -1080,7 +1272,7 @@ static bool TranslateTableFilter(const TableFilter &table_filter, idx_t col_pos,
 	switch (table_filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = table_filter.Cast<ConstantFilter>();
-		if (constant_filter.constant.IsNull() || !constant_filter.constant.type().IsNumeric()) {
+		if (constant_filter.constant.IsNull()) {
 			return false;
 		}
 		MlxExprOpCode code;
@@ -1110,8 +1302,30 @@ static bool TranslateTableFilter(const TableFilter &table_filter, idx_t col_pos,
 		    !MlxExprTranslator::IsSupportedColumnType(get.returned_types[storage_idx])) {
 			return false;
 		}
+		auto &col_type = get.returned_types[storage_idx];
+		Value konst = constant_filter.constant;
+		MlxExprOp const_op {MlxExprOpCode::CONST_VAL, 0, 0};
+		if (MlxExprTranslator::IsIntLaneType(col_type)) {
+			if (konst.type() != col_type && !konst.DefaultTryCastAs(col_type)) {
+				duckdb_mlx::LogDebug("MLX: decimal filter constant of type " + konst.type().ToString() + " declined");
+				return false;
+			}
+			const_op.ivalue = MlxExprTranslator::DecimalRaw(konst);
+			const_op.int_lane = true;
+		} else if (col_type.id() == LogicalTypeId::DATE) {
+			if (konst.type().id() != LogicalTypeId::DATE && !konst.DefaultTryCastAs(LogicalType::DATE)) {
+				duckdb_mlx::LogDebug("MLX: date filter constant of type " + konst.type().ToString() + " declined");
+				return false;
+			}
+			const_op.value = static_cast<double>(konst.GetValue<date_t>().days);
+		} else if (konst.type().IsNumeric()) {
+			const_op.value = konst.GetValue<double>();
+		} else {
+			duckdb_mlx::LogDebug("MLX: filter constant of type " + konst.type().ToString() + " declined");
+			return false;
+		}
 		ops.push_back({MlxExprOpCode::LOAD_COL, NumericCast<int32_t>(storage_idx), 0});
-		ops.push_back({MlxExprOpCode::CONST_VAL, 0, constant_filter.constant.GetValue<double>()});
+		ops.push_back(const_op);
 		ops.push_back({code, 0, 0});
 		referenced.insert(NumericCast<int32_t>(storage_idx));
 		return true;
@@ -1149,6 +1363,9 @@ static bool TranslateTableFilter(const TableFilter &table_filter, idx_t col_pos,
 		referenced.insert(NumericCast<int32_t>(storage_idx));
 		return true;
 	default:
+		duckdb_mlx::LogDebug("MLX: unsupported table filter type " +
+		                     std::to_string(static_cast<int>(table_filter.filter_type)) + " on column " +
+		                     std::to_string(storage_idx));
 		return false;
 	}
 }
@@ -1408,7 +1625,8 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 		bool first = true;
 		for (auto &expr : filter_op->expressions) {
 			MlxExprTranslator translator(*get, nullptr);
-			if (!translator.Translate(*expr)) {
+			MlxExprTranslator::Lane expr_lane;
+			if (!translator.Translate(*expr, expr_lane) || expr_lane != MlxExprTranslator::Lane::BOOL_LANE) {
 				return false;
 			}
 			cache_filter.ops.insert(cache_filter.ops.end(), translator.ops.begin(), translator.ops.end());
@@ -1445,6 +1663,68 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 	}
 	cache_filter.null_cols.assign(filter_cols.begin(), filter_cols.end());
 
+	// interval bound of |program| per row from column statistics; declines
+	// int-lane sums whose exact int64 accumulation could overflow
+	auto program_abs_bound = [&](const MlxSumProgram &program, double &bound) {
+		std::vector<double> stack;
+		for (auto &op : program.ops) {
+			switch (op.code) {
+			case MlxExprOpCode::LOAD_COL: {
+				unique_ptr<BaseStatistics> stats;
+				if (get->function.statistics_extended) {
+					auto &column_ids = get->GetColumnIds();
+					idx_t pos = column_ids.size();
+					for (idx_t i = 0; i < column_ids.size(); i++) {
+						if (column_ids[i].GetPrimaryIndex() == static_cast<idx_t>(op.col)) {
+							pos = i;
+							break;
+						}
+					}
+					if (pos < column_ids.size()) {
+						TableFunctionGetStatisticsInput input(get->bind_data.get(), column_ids[pos]);
+						stats = get->function.statistics_extended(context, input);
+					}
+				}
+				if (!stats || !NumericStats::HasMinMax(*stats)) {
+					return false;
+				}
+				auto lo = NumericStats::Min(*stats).GetValue<double>();
+				auto hi = NumericStats::Max(*stats).GetValue<double>();
+				double raw_scale = 1.0;
+				auto &col_type = get->returned_types[op.col];
+				if (col_type.id() == LogicalTypeId::DECIMAL) {
+					raw_scale = static_cast<double>(MlxExprTranslator::Pow10(DecimalType::GetScale(col_type)));
+				}
+				stack.push_back(std::max(std::abs(lo), std::abs(hi)) * raw_scale);
+				break;
+			}
+			case MlxExprOpCode::CONST_VAL:
+				stack.push_back(op.int_lane ? std::abs(static_cast<double>(op.ivalue)) : std::abs(op.value));
+				break;
+			case MlxExprOpCode::ADD:
+			case MlxExprOpCode::SUB: {
+				auto b = stack.back();
+				stack.pop_back();
+				stack.back() += b;
+				break;
+			}
+			case MlxExprOpCode::MUL: {
+				auto b = stack.back();
+				stack.pop_back();
+				stack.back() *= b;
+				break;
+			}
+			case MlxExprOpCode::NEGATE:
+			case MlxExprOpCode::ABS:
+				break;
+			default:
+				return false;
+			}
+		}
+		bound = stack.empty() ? 0.0 : stack.back();
+		return true;
+	};
+
 	vector<MlxSumProgram> programs;
 	vector<LogicalType> agg_types;
 	for (auto &expr : agg.expressions) {
@@ -1461,8 +1741,8 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 			program.kind = MlxAggKind::COUNT_STAR;
 		} else if (name == "count" && aggr.children.size() == 1) {
 			program.kind = MlxAggKind::COUNT;
-		} else if (aggr.children.size() == 1 && aggr.return_type.id() == LogicalTypeId::DOUBLE) {
-			if (name == "sum") {
+		} else if (aggr.children.size() == 1) {
+			if (name == "sum" || name == "sum_no_overflow") {
 				program.kind = MlxAggKind::SUM;
 			} else if (name == "avg") {
 				program.kind = MlxAggKind::AVG;
@@ -1478,15 +1758,62 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 		}
 		if (!aggr.children.empty()) {
 			MlxExprTranslator translator(*get, proj);
-			if (!translator.Translate(*aggr.children[0])) {
+			MlxExprTranslator::Lane lane;
+			if (!translator.Translate(*aggr.children[0], lane) || lane == MlxExprTranslator::Lane::BOOL_LANE) {
 				return false;
 			}
+			program.int_lane = lane == MlxExprTranslator::Lane::INT_LANE;
 			program.ops = std::move(translator.ops);
 			program.null_cols.assign(translator.referenced_cols.begin(), translator.referenced_cols.end());
 		}
-		agg_types.push_back(program.kind == MlxAggKind::COUNT || program.kind == MlxAggKind::COUNT_STAR
-		                        ? LogicalType::BIGINT
-		                        : LogicalType::DOUBLE);
+
+		// result typing: exact DECIMAL results ride the int lane
+		if (program.kind == MlxAggKind::COUNT || program.kind == MlxAggKind::COUNT_STAR) {
+			if (aggr.return_type.id() != LogicalTypeId::BIGINT) {
+				return false;
+			}
+			agg_types.push_back(LogicalType::BIGINT);
+		} else if (program.int_lane) {
+			auto &child_type = aggr.children[0]->return_type;
+			if (child_type.id() != LogicalTypeId::DECIMAL) {
+				return false;
+			}
+			auto child_scale = DecimalType::GetScale(child_type);
+			switch (program.kind) {
+			case MlxAggKind::SUM:
+				if (aggr.return_type.id() != LogicalTypeId::DECIMAL ||
+				    DecimalType::GetScale(aggr.return_type) != child_scale) {
+					return false;
+				}
+				agg_types.push_back(aggr.return_type);
+				break;
+			case MlxAggKind::AVG:
+				if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
+					return false;
+				}
+				program.render_scale = 1.0 / static_cast<double>(MlxExprTranslator::Pow10(child_scale));
+				agg_types.push_back(LogicalType::DOUBLE);
+				break;
+			default: // MIN / MAX keep the child's decimal type
+				if (aggr.return_type != child_type) {
+					return false;
+				}
+				agg_types.push_back(aggr.return_type);
+				break;
+			}
+			if (program.kind == MlxAggKind::SUM || program.kind == MlxAggKind::AVG) {
+				double bound = 0;
+				if (!program_abs_bound(program, bound) ||
+				    bound * static_cast<double>(std::max<idx_t>(estimated_rows, 1)) >= std::ldexp(1.0, 61)) {
+					return false; // exact int64 accumulation could overflow
+				}
+			}
+		} else {
+			if (aggr.return_type.id() != LogicalTypeId::DOUBLE) {
+				return false;
+			}
+			agg_types.push_back(LogicalType::DOUBLE);
+		}
 		programs.push_back(std::move(program));
 	}
 

@@ -61,7 +61,7 @@ std::vector<MlxVssBatchMatch> MlxVssSearchBatch(const std::string &name, const f
 
 enum class MlxExprOpCode : uint8_t {
 	LOAD_COL,  // push column `col`
-	CONST_VAL, // push constant `value`
+	CONST_VAL, // push constant `value` (or `ivalue` when int_lane)
 	ADD,
 	SUB,
 	MUL,
@@ -71,6 +71,9 @@ enum class MlxExprOpCode : uint8_t {
 	COS,
 	SQRT,
 	ABS,
+	//! int64 -> float32 followed by multiply with `value` (decimal -> double
+	//! casts use 1/10^scale)
+	TO_FLOAT,
 	// predicates (produce boolean arrays)
 	CMP_LT,
 	CMP_LE,
@@ -83,10 +86,16 @@ enum class MlxExprOpCode : uint8_t {
 	NOT,
 };
 
+//! Two evaluation lanes: fp32 (numeric/date columns) and exact int64
+//! (DECIMAL columns as raw scaled integers — fp32 would silently corrupt
+//! them). Lanes only meet at comparisons (same-lane operands enforced by the
+//! translator) and TO_FLOAT.
 struct MlxExprOp {
 	MlxExprOpCode code;
 	int32_t col = 0;
 	double value = 0;
+	int64_t ivalue = 0;    // integer-lane constant (raw decimal, exceeds 2^53)
+	bool int_lane = false; // lane of a CONST_VAL push
 };
 
 enum class MlxAggKind : uint8_t {
@@ -104,6 +113,11 @@ struct MlxSumProgram {
 	std::vector<MlxExprOp> ops;
 	//! Columns whose NULL mask excludes a row from this aggregate
 	std::vector<int32_t> null_cols;
+	//! Exact int64 evaluation (DECIMAL expressions); results land in ivalue
+	bool int_lane = false;
+	//! Multiplier the planner applies when rendering a DOUBLE result from a
+	//! raw-scaled int-lane value (e.g. avg(DECIMAL) => 10^-scale)
+	double render_scale = 1.0;
 };
 
 //! WHERE-clause predicate applied to every aggregate (rows where it is false
@@ -115,13 +129,15 @@ struct MlxFilter {
 };
 
 struct MlxColumnData {
-	const float *values;  // nulls hold 0.0; fp32 conversion happens at sink time
-	const uint8_t *valid; // 1 = valid; nullptr = all valid
+	const float *values = nullptr;    // fp32 lane (nulls hold 0.0)
+	const uint8_t *valid = nullptr;   // 1 = valid; nullptr = all valid
+	const int64_t *ivalues = nullptr; // int64 lane (raw scaled decimals)
 };
 
 struct MlxSumResult {
 	double value;
 	int64_t valid_count; // 0 => SQL NULL (for COUNT kinds the result itself)
+	int64_t ivalue = 0;  // exact result for int-lane programs
 };
 
 //! Evaluates each aggregate program over `count` rows of `cols` on the GPU
@@ -136,8 +152,12 @@ std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, si
 // populated incrementally while reusing row-aligned segments already cached.
 
 struct MlxZoneMap {
-	float min_val = 0;
-	float max_val = 0;
+	double min_val = 0;
+	double max_val = 0;
+	//! exact bounds for int64-lane columns (raw decimals exceed 2^53)
+	int64_t imin = 0;
+	int64_t imax = 0;
+	bool int_lane = false;
 	bool has_null = false;
 };
 

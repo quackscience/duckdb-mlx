@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -177,7 +178,11 @@ MlxSegment SegmentFromHost(const std::vector<MlxColumnData> &cols, size_t count)
 	segment.count = static_cast<int64_t>(count);
 	auto shape = mx::Shape {static_cast<int>(count)};
 	for (auto &col : cols) {
-		segment.cols.emplace_back(mx::array(col.values, shape, mx::float32));
+		if (col.ivalues) {
+			segment.cols.emplace_back(mx::array(col.ivalues, shape, mx::int64));
+		} else {
+			segment.cols.emplace_back(mx::array(col.values, shape, mx::float32));
+		}
 		if (col.valid) {
 			segment.valids.emplace_back(mx::array(col.valid, shape, mx::uint8));
 		} else {
@@ -218,8 +223,18 @@ mx::array EvalOps(const MlxSegment &segment, const std::vector<MlxExprOp> &ops) 
 			stack.push_back(segment.cols[op.col]);
 			break;
 		case MlxExprOpCode::CONST_VAL:
-			stack.push_back(mx::array(static_cast<float>(op.value)));
+			if (op.int_lane) {
+				stack.push_back(mx::array(op.ivalue, mx::int64));
+			} else {
+				stack.push_back(mx::array(static_cast<float>(op.value)));
+			}
 			break;
+		case MlxExprOpCode::TO_FLOAT: {
+			auto a = stack.back();
+			stack.pop_back();
+			stack.push_back(mx::multiply(mx::astype(a, mx::float32), mx::array(static_cast<float>(op.value))));
+			break;
+		}
 		case MlxExprOpCode::NEGATE:
 		case MlxExprOpCode::SIN:
 		case MlxExprOpCode::COS:
@@ -335,19 +350,21 @@ void BuildSumGraphs(const MlxSegment &segment, const std::vector<MlxSumProgram> 
 		auto mask = CombineMasks(filter_mask, NullMask(segment, program.null_cols));
 		if (HasValueGraph(program.kind)) {
 			auto expr = EvalOps(segment, program.ops);
+			// neutral elements per lane: the int lane reduces exactly in int64
+			auto neutral_zero = program.int_lane ? mx::array(static_cast<int64_t>(0), mx::int64) : mx::array(0.0f);
+			auto neutral_min = program.int_lane ? mx::array(std::numeric_limits<int64_t>::max(), mx::int64)
+			                                    : mx::array(std::numeric_limits<float>::infinity());
+			auto neutral_max = program.int_lane ? mx::array(std::numeric_limits<int64_t>::min(), mx::int64)
+			                                    : mx::array(-std::numeric_limits<float>::infinity());
 			switch (program.kind) {
 			case MlxAggKind::MIN:
-				outs.push_back(mask.has_value()
-				                   ? mx::min(mx::where(*mask, expr, mx::array(std::numeric_limits<float>::infinity())))
-				                   : mx::min(expr));
+				outs.push_back(mask.has_value() ? mx::min(mx::where(*mask, expr, neutral_min)) : mx::min(expr));
 				break;
 			case MlxAggKind::MAX:
-				outs.push_back(mask.has_value()
-				                   ? mx::max(mx::where(*mask, expr, mx::array(-std::numeric_limits<float>::infinity())))
-				                   : mx::max(expr));
+				outs.push_back(mask.has_value() ? mx::max(mx::where(*mask, expr, neutral_max)) : mx::max(expr));
 				break;
 			default: // SUM / AVG
-				outs.push_back(mask.has_value() ? mx::sum(mx::where(*mask, expr, mx::array(0.0f))) : mx::sum(expr));
+				outs.push_back(mask.has_value() ? mx::sum(mx::where(*mask, expr, neutral_zero)) : mx::sum(expr));
 				break;
 			}
 		}
@@ -365,23 +382,32 @@ void MergeSegmentOutputs(const MlxSegment &segment, const std::vector<MlxSumProg
 	for (size_t p = 0; p < programs.size(); p++) {
 		auto &program = programs[p];
 		double value = 0;
+		int64_t ivalue = 0;
 		if (HasValueGraph(program.kind)) {
-			value = static_cast<double>(outs[cursor++].item<float>());
+			if (program.int_lane) {
+				ivalue = outs[cursor++].item<int64_t>();
+				value = static_cast<double>(ivalue);
+			} else {
+				value = static_cast<double>(outs[cursor++].item<float>());
+			}
 		}
 		int64_t count = SegmentHasMask(segment, filter, program) ? static_cast<int64_t>(outs[cursor++].item<int32_t>())
 		                                                         : segment.count;
 		switch (program.kind) {
 		case MlxAggKind::MIN:
 			results[p].value = std::min(results[p].value, value);
+			results[p].ivalue = std::min(results[p].ivalue, ivalue);
 			break;
 		case MlxAggKind::MAX:
 			results[p].value = std::max(results[p].value, value);
+			results[p].ivalue = std::max(results[p].ivalue, ivalue);
 			break;
 		case MlxAggKind::COUNT:
 		case MlxAggKind::COUNT_STAR:
 			break;
 		default:
 			results[p].value += value;
+			results[p].ivalue += ivalue;
 			break;
 		}
 		results[p].valid_count += count;
@@ -396,13 +422,13 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 	for (auto &program : programs) {
 		switch (program.kind) {
 		case MlxAggKind::MIN:
-			results.push_back({std::numeric_limits<double>::infinity(), 0});
+			results.push_back({std::numeric_limits<double>::infinity(), 0, std::numeric_limits<int64_t>::max()});
 			break;
 		case MlxAggKind::MAX:
-			results.push_back({-std::numeric_limits<double>::infinity(), 0});
+			results.push_back({-std::numeric_limits<double>::infinity(), 0, std::numeric_limits<int64_t>::min()});
 			break;
 		default:
-			results.push_back({0.0, 0});
+			results.push_back({0.0, 0, 0});
 			break;
 		}
 	}
@@ -410,7 +436,9 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 	struct PrunePred {
 		int32_t col;
 		MlxExprOpCode code;
-		float constant;
+		double constant; // fp32-lane compare bound
+		int64_t iconst;  // exact bound for int-lane columns
+		bool int_lane;
 	};
 	std::vector<PrunePred> prune_preds;
 	if (segment_zone_maps && !filter.ops.empty()) {
@@ -426,7 +454,8 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 			if (cmp < MlxExprOpCode::CMP_LT || cmp > MlxExprOpCode::CMP_NE) {
 				return false;
 			}
-			prune_preds.push_back({filter.ops[i].col, cmp, static_cast<float>(filter.ops[i + 1].value)});
+			auto &konst = filter.ops[i + 1];
+			prune_preds.push_back({filter.ops[i].col, cmp, konst.value, konst.ivalue, konst.int_lane});
 			i += 3;
 			return true;
 		};
@@ -457,34 +486,44 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 				return false;
 			}
 			auto &zm = (*segment_zone_maps)[pred.col][seg_idx];
+			if (pred.int_lane != zm.int_lane) {
+				return false; // lane mismatch: never prune
+			}
+			// exact int64 bounds for the int lane; double bounds otherwise
+			auto lo = zm.int_lane ? static_cast<double>(zm.imin) : zm.min_val;
+			auto hi = zm.int_lane ? static_cast<double>(zm.imax) : zm.max_val;
+			auto ilo = zm.imin;
+			auto ihi = zm.imax;
+			auto c = pred.constant;
+			auto ic = pred.iconst;
 			switch (pred.code) {
 			case MlxExprOpCode::CMP_LT:
-				if (zm.min_val >= pred.constant) {
+				if (zm.int_lane ? ilo >= ic : lo >= c) {
 					return true;
 				}
 				break;
 			case MlxExprOpCode::CMP_LE:
-				if (zm.min_val > pred.constant) {
+				if (zm.int_lane ? ilo > ic : lo > c) {
 					return true;
 				}
 				break;
 			case MlxExprOpCode::CMP_GT:
-				if (zm.max_val <= pred.constant) {
+				if (zm.int_lane ? ihi <= ic : hi <= c) {
 					return true;
 				}
 				break;
 			case MlxExprOpCode::CMP_GE:
-				if (zm.max_val < pred.constant) {
+				if (zm.int_lane ? ihi < ic : hi < c) {
 					return true;
 				}
 				break;
 			case MlxExprOpCode::CMP_EQ:
-				if (pred.constant < zm.min_val || pred.constant > zm.max_val) {
+				if (zm.int_lane ? (ic < ilo || ic > ihi) : (c < lo || c > hi)) {
 					return true;
 				}
 				break;
 			case MlxExprOpCode::CMP_NE:
-				if (!zm.has_null && zm.min_val == zm.max_val && zm.min_val == pred.constant) {
+				if (!zm.has_null && (zm.int_lane ? (ilo == ihi && ilo == ic) : (lo == hi && lo == c))) {
 					return true;
 				}
 				break;
@@ -566,7 +605,10 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 	}
 	for (size_t p = 0; p < programs.size(); p++) {
 		if (programs[p].kind == MlxAggKind::AVG && results[p].valid_count > 0) {
-			results[p].value /= static_cast<double>(results[p].valid_count);
+			// int lane: exact int64 sum divided once (raw scale handled by
+			// the planner when rendering)
+			auto numerator = programs[p].int_lane ? static_cast<double>(results[p].ivalue) : results[p].value;
+			results[p].value = numerator / static_cast<double>(results[p].valid_count);
 		}
 	}
 	return results;
@@ -601,31 +643,34 @@ std::unordered_map<std::string, MlxTableLayout> &TableLayouts() {
 	return layouts;
 }
 
-MlxZoneMap ComputeZoneMap(const float *values, const uint8_t *valid, size_t count) {
+template <class T>
+MlxZoneMap ComputeZoneMapT(const T *values, const uint8_t *valid, size_t count) {
 	MlxZoneMap zm;
 	if (count == 0) {
 		return zm;
 	}
-	zm.min_val = std::numeric_limits<float>::infinity();
-	zm.max_val = -std::numeric_limits<float>::infinity();
-	if (valid) {
-		for (size_t i = 0; i < count; i++) {
-			if (!valid[i]) {
-				zm.has_null = true;
-				continue;
-			}
-			zm.min_val = std::min(zm.min_val, values[i]);
-			zm.max_val = std::max(zm.max_val, values[i]);
+	T lo = std::numeric_limits<T>::max();
+	T hi = std::numeric_limits<T>::lowest();
+	bool any = false;
+	for (size_t i = 0; i < count; i++) {
+		if (valid && !valid[i]) {
+			zm.has_null = true;
+			continue;
 		}
-	} else {
-		for (size_t i = 0; i < count; i++) {
-			zm.min_val = std::min(zm.min_val, values[i]);
-			zm.max_val = std::max(zm.max_val, values[i]);
-		}
+		lo = std::min(lo, values[i]);
+		hi = std::max(hi, values[i]);
+		any = true;
 	}
-	if (zm.min_val > zm.max_val) {
-		zm.min_val = 0;
-		zm.max_val = 0;
+	if (!any) {
+		lo = 0;
+		hi = 0;
+	}
+	zm.min_val = static_cast<double>(lo);
+	zm.max_val = static_cast<double>(hi);
+	if (std::is_integral<T>::value) {
+		zm.int_lane = true;
+		zm.imin = static_cast<int64_t>(lo);
+		zm.imax = static_cast<int64_t>(hi);
 	}
 	return zm;
 }
@@ -648,15 +693,20 @@ void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t
 	if (take == 0) {
 		return;
 	}
-	auto zm = ComputeZoneMap(col.values + offset, col.valid ? col.valid + offset : nullptr, take);
 	mx::Shape shape {static_cast<int>(take)};
-	cached.segments.push_back(mx::array(col.values + offset, shape, mx::float32));
+	auto valid_ptr = col.valid ? col.valid + offset : nullptr;
+	if (col.ivalues) {
+		cached.zone_maps.push_back(ComputeZoneMapT<int64_t>(col.ivalues + offset, valid_ptr, take));
+		cached.segments.push_back(mx::array(col.ivalues + offset, shape, mx::int64));
+	} else {
+		cached.zone_maps.push_back(ComputeZoneMapT<float>(col.values + offset, valid_ptr, take));
+		cached.segments.push_back(mx::array(col.values + offset, shape, mx::float32));
+	}
 	if (col.valid) {
-		cached.valids.push_back(mx::array(col.valid + offset, shape, mx::uint8));
+		cached.valids.push_back(mx::array(valid_ptr, shape, mx::uint8));
 	} else {
 		cached.valids.push_back(std::nullopt);
 	}
-	cached.zone_maps.push_back(zm);
 	cached.rows += static_cast<int64_t>(take);
 	cached.population = population;
 }
