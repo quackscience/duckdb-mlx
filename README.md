@@ -2,98 +2,113 @@
 
 GPU-accelerated DuckDB on Apple Silicon (Metal / MLX).
 
-`duckdb_mlx` is a loadable DuckDB extension that transparently executes analytical query
-pipelines on the Apple Silicon GPU, and falls back silently to DuckDB's CPU engine for
-anything unsupported. See [docs/PLAN.md](docs/PLAN.md) for the full architecture and
+`duckdb_mlx` is a loadable DuckDB extension that executes analytical workloads on the
+Apple Silicon GPU. See [docs/PLAN.md](docs/PLAN.md) for the full architecture and
 roadmap; the design ports concepts from NVIDIA GQE and Sirius, re-derived for unified
-memory.
+memory. Progress is test-gated: every capability lands with a passing differential test
+against DuckDB's own CPU results before it is committed.
+
+**Status:** Phase 0 complete — MLX runs inside the extension, data flows DuckDB → GPU →
+DuckDB, and the first flagship use-case (GPU-resident vector similarity search) is
+working, tested, and benchmarked. The transparent optimizer hook (plain SQL silently
+accelerated) is the next phase.
+
+## Flagship: GPU-resident vector search
 
 ```sql
 LOAD 'duckdb_mlx';
--- plain SQL now runs on the Apple GPU when supported
-SELECT l_returnflag, sum(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1;
-SET mlx_execution = false;  -- per-connection opt-out
+
+-- one-time: pin an embedding column as a GPU-resident, L2-normalized matrix
+SELECT mlx_vss_pin('items', list(emb ORDER BY id)) FROM items;
+
+-- cosine top-k, one matvec against the pinned matrix
+SELECT idx, score FROM mlx_vss_search('items', [0.12, 0.34, ...], 10);
+
+-- Q queries in a single matmul (reranking / batch scoring / similarity joins)
+SELECT query_no, idx, score FROM mlx_vss_search_batch('items', [[...], [...]], 10);
 ```
 
-**Status:** Phase 0 — extension skeleton. The extension loads, registers its settings
-(`mlx_execution`, `mlx_min_rows`, `mlx_log_level`) and an `mlx_info()` function; no GPU
-execution yet.
+Measured on a base M4 (24 GB), 1M vectors × 384 dims fp32 (~1.5 GB), hot cache,
+verified result-identical to DuckDB's `array_cosine_similarity` brute force:
 
-The extension builds on all DuckDB platforms. The GPU execution path is compiled in only
-on Apple Silicon (`DUCKDB_MLX_ENABLE_GPU`, auto-detected); elsewhere every plan stays on
-the CPU engine.
+| Workload | DuckDB CPU (all cores) | duckdb-mlx GPU | Speedup |
+|---|---|---|---|
+| 1 query, top-10 | 70 ms | 20 ms | 3.5× (at bandwidth floor) |
+| 32 queries | ~1.7 s | ~105 ms | **16×** |
+| 128 queries | ~6.5 s | ~375 ms | **17×** |
+
+Pin cost is ~5 s one-time and amortizes across all queries. Reproduce with
+`benchmark/bench_vss.sql` and `benchmark/bench_vss_batch.sql`.
+
+## All functions
+
+| Function | Purpose |
+|---|---|
+| `mlx_info()` | extension/GPU/MLX/spdlog status string |
+| `mlx_selftest()` | end-to-end GPU sanity check, returns `ok` |
+| `mlx_vss_pin(name, list(col))` | pin a `FLOAT[N]` column as a GPU-resident matrix |
+| `mlx_vss_search(name, query, k)` | cosine top-k against a pinned matrix |
+| `mlx_vss_search_batch(name, queries, k)` | batched top-k, one matmul |
+| `mlx_sum(BIGINT[])`, `mlx_expr_bench(BIGINT[])` | Phase 0 spike/benchmark vehicles |
+
+Settings: `mlx_execution` (reserved for the Phase 1 optimizer hook), `mlx_min_rows`,
+`mlx_log_level`.
+
+The extension builds on all DuckDB platforms; the GPU path is compiled in only on Apple
+Silicon (`DUCKDB_MLX_ENABLE_GPU`, auto-detected) and GPU functions raise clean errors
+elsewhere.
 
 ## Repository layout
 
 ```
 src/
-├── duckdb_mlx_extension.cpp   # load/register, settings, optimizer hook
-├── planner/                   # logical-plan walker, supported-subtree detection
-├── format/                    # MlxTableFormat: ingest, encode, zone maps, cache
-├── ops/                       # Tier A graph builders (project/filter/agg/sort)
-├── kernels/                   # Tier B .metal sources + launch wrappers
-├── exec/                      # pipeline scheduler, streams, fallback runtime
-└── bridge/                    # DataChunk ⇄ GPU buffer conversion
-test/sql/                      # sqllogictest files (DuckDB harness)
-test/cpp/                      # kernel unit tests
-benchmark/                     # TPC-H harness, GPU-vs-CPU diff runner
+├── duckdb_mlx_extension.cpp   # load/register, settings, spike functions
+├── ops/mlx_vss.cpp            # vector-search scalar + table functions
+├── bridge/mlx_bridge.cpp      # the only TU that includes MLX headers
+├── mlx_logger.cpp             # the only TU that includes spdlog headers
+├── planner/ format/ kernels/ exec/   # reserved for Phase 1+ (see docs/PLAN.md §5)
+└── include/                   # bridge/logger interfaces (no MLX/spdlog types)
+test/sql/                      # sqllogictests incl. GPU-vs-CPU differentials
+benchmark/                     # reproduction scripts for the numbers above
+third_party/mlx/               # MLX v0.31.2 submodule (Apple-only, not vcpkg)
 ```
+
+Isolation rule (learned the hard way): DuckDB's vendored fmt shadows the real fmt for
+every extension target, so MLX and spdlog each live in a dedicated static library whose
+inherited include paths are cleared — no translation unit ever includes both `duckdb.hpp`
+and MLX/spdlog headers. Data crosses the bridge as raw unified-memory pointers.
 
 ## Building
 
-### Dependencies
-
-C++ dependencies are managed with [vcpkg](https://vcpkg.io) for cross-platform support
-(declared in `vcpkg.json`, currently spdlog). Set it up once:
+Portable C++ dependencies are managed with [vcpkg](https://vcpkg.io) (`vcpkg.json`;
+currently spdlog). MLX is vendored as a submodule and built automatically into
+`build/mlx-install` on first configure (`scripts/build_mlx.sh`). Requires macOS 14+,
+Xcode (for the Metal compiler), CMake and ninja.
 
 ```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
+git clone https://github.com/Microsoft/vcpkg.git && ./vcpkg/bootstrap-vcpkg.sh
 export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+git submodule update --init          # duckdb v1.5.4, extension-ci-tools, mlx v0.31.2
+GEN=ninja make release
 ```
 
-MLX itself is Apple-only and not in the vcpkg registry; it will be vendored under
-`third_party/` when the GPU execution path lands (Phase 0 spike).
-
-### Build steps
+Main artifacts:
 
 ```shell
-git submodule update --init
-make
-```
-
-The main binaries that will be built are:
-
-```shell
-./build/release/duckdb                                            # shell with the extension pre-loaded
+./build/release/duckdb                                            # shell, extension pre-loaded
 ./build/release/test/unittest                                     # test runner
 ./build/release/extension/duckdb_mlx/duckdb_mlx.duckdb_extension  # loadable extension
 ```
 
-## Running
-
-```
-$ ./build/release/duckdb
-D SELECT mlx_info();
-┌─────────────────────────────────────────┐
-│               mlx_info()                │
-│                 varchar                 │
-├─────────────────────────────────────────┤
-│ duckdb_mlx gpu=available spdlog=1.16.0  │
-└─────────────────────────────────────────┘
-```
-
 ## Testing
 
-SQL logic tests live in `./test/sql` and run with:
-
 ```shell
-make test
+GEN=ninja make test
 ```
 
-Every GPU-supported query will also be executed with `mlx_execution=false` and the
-results diffed automatically — this differential harness is permanent infrastructure
-(see docs/PLAN.md §Phase 1).
+SQL logic tests live in `test/sql/`; every GPU capability is diffed against DuckDB's CPU
+results (the permanent differential harness from docs/PLAN.md Phase 1).
 
 ## License
 

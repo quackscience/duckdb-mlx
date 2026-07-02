@@ -1,7 +1,44 @@
 # duckdb-mlx — GPU-Accelerated DuckDB on Apple Silicon (Metal / MLX)
 
-**Status:** Draft v0.1 — planning document for review and iteration
+**Status:** v0.2 — Phase 0 complete, flagship use-case shipped (see §0)
 **References:** NVIDIA GQE (rapidsai/gqe, NVIDIA blog Jun 2026), Sirius (sirius-db/sirius)
+
+---
+
+## 0. Progress Log
+
+### 2026-07-02 — Phase 0 complete + flagship use-case
+
+**Done, all test-gated (26 sqllogictest assertions passing):**
+- Extension skeleton from template; settings; spdlog via vcpkg; DuckDB pinned v1.5.4.
+- MLX v0.31.2 vendored (`third_party/mlx`, built to `build/mlx-install`, imported
+  target). Spike 1 (MLX-in-extension) and spike 2 (DuckDB→GPU data bridge) both **go**:
+  `mlx_selftest()` = ok, `mlx_sum()` diffed against CPU over 1M rows.
+- **Isolation constraint discovered:** DuckDB's vendored fmt (namespace `duckdb_fmt`,
+  same `<fmt/...>` include paths/guards) shadows real fmt for all extension targets.
+  Resolution: MLX and spdlog each live in a dedicated static lib with inherited include
+  dirs cleared; DuckDB headers and MLX/spdlog headers never share a TU. This is now the
+  permanent architecture of `bridge/` (and validates §9 Q1: C++ core works, no
+  exception/ABI friction observed).
+- **Flagship use-case shipped: GPU-resident vector similarity search** (`mlx_vss_pin`,
+  `mlx_vss_search`, `mlx_vss_search_batch`) — the §3.2 resident-cache concept
+  specialized to embeddings. M4 (base, 24 GB), 1M×384 fp32: single query 3.5×
+  (bandwidth floor), 32–128 batched queries **16–17×** vs DuckDB LATERAL brute force.
+
+**Measured platform facts (M4 base) that refine §2:**
+- DuckDB CPU `sum()` runs at ~100 GB/s — full memory bandwidth. Confirmed: scan-bound
+  ops cannot win on GPU; do not chase them.
+- ALU-dense expressions (sin·cos+sqrt): GPU ~3× over CPU net of ingest overhead.
+- The `list()` ingest vehicle costs 4–5× the GPU compute itself — direct plan/scan
+  integration (Phase 1) is where end-to-end wins materialize.
+- MLX `argpartition` appears sort-based on Metal (no gain over argsort at 1M): a custom
+  top-k kernel is a real Tier-B candidate.
+
+**Next, in effort-to-payoff order:**
+1. fp16 pinning for VSS (halves bytes → ~2× across the board; standard for embeddings).
+2. `mlx_vss_pin` from a table scan directly (drop the `list()` vehicle).
+3. Custom top-k Metal kernel (large-Q batches leave time on the table).
+4. Phase 1 optimizer hook (transparent `SCAN→FILTER→PROJ→AGG`), per original roadmap.
 
 ---
 
