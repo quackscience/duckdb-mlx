@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "mlx_logger.hpp"
+#include "mlx_vss.hpp"
 
 #ifdef DUCKDB_MLX_GPU_ENABLED
 #include "mlx_bridge.hpp"
@@ -152,6 +153,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("mlx_sum", {LogicalType::LIST(LogicalType::BIGINT)}, LogicalType::BIGINT, MlxSumFun));
 	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
 	                                       LogicalType::DOUBLE, MlxExprBenchFun));
+	RegisterMlxVss(loader);
 
 	duckdb_mlx::SetLogLevel("warn");
 	duckdb_mlx::LogDebug(StringUtil::Format("duckdb_mlx loaded (gpu=%s)", MLX_GPU_AVAILABLE ? "true" : "false"));

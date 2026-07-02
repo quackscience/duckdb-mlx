@@ -41,7 +41,7 @@ endif()
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/duckdb_mlx_extension.cpp)
+set(EXTENSION_SOURCES src/duckdb_mlx_extension.cpp src/ops/mlx_vss.cpp)
 
 # mlx_logger.cpp isolates spdlog: DuckDB's vendored fmt shadows the real fmt on
 # the include path (same <fmt/...> paths, renamed duckdb_fmt namespace), which

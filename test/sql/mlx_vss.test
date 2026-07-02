@@ -1,0 +1,78 @@
+# name: test/sql/mlx_vss.test
+# description: GPU-resident cosine top-k matches DuckDB's array_cosine_similarity
+# group: [sql]
+
+require duckdb_mlx
+
+# Deterministic, tie-free embeddings
+statement ok
+CREATE TABLE docs AS
+SELECT i AS id, list_transform(range(8), j -> sin(i * 10 + j)::FLOAT)::FLOAT[8] AS emb
+FROM range(100) t(i);
+
+query I
+SELECT mlx_vss_pin('docs', list(emb ORDER BY id)) FROM docs;
+----
+100
+
+# Searching with a row's own embedding must return that row first with score ~1
+statement ok
+SET VARIABLE q = (SELECT emb::FLOAT[] FROM docs WHERE id = 42);
+
+query I
+SELECT idx FROM mlx_vss_search('docs', getvariable('q'), 1);
+----
+42
+
+query I
+SELECT score > 0.9999 FROM mlx_vss_search('docs', getvariable('q'), 1);
+----
+true
+
+# Differential: GPU top-5 set == CPU brute-force top-5 set
+query I
+SELECT (SELECT list_sort(list(idx)) FROM mlx_vss_search('docs', getvariable('q'), 5)) =
+       (SELECT list_sort(list(id))
+        FROM (SELECT id FROM docs
+              ORDER BY array_cosine_similarity(emb, getvariable('q')::FLOAT[8]) DESC
+              LIMIT 5));
+----
+true
+
+# Scores arrive in descending order
+query I
+SELECT list(score ORDER BY score DESC) = list(score) FROM mlx_vss_search('docs', getvariable('q'), 10);
+----
+true
+
+# Unknown name errors cleanly
+statement error
+SELECT * FROM mlx_vss_search('nope', [1.0, 2.0], 3);
+----
+Invalid Input Error: mlx_vss_search: no pinned matrix named 'nope' — call mlx_vss_pin first
+
+# Dimension mismatch errors cleanly
+statement error
+SELECT * FROM mlx_vss_search('docs', [1.0, 2.0], 3);
+----
+Invalid Input Error: mlx_vss_search: query dimension 2 does not match pinned dimension 8
+
+# Batched search: each query's top-5 set must match the CPU lateral join
+statement ok
+SET VARIABLE qs = (SELECT list(emb::FLOAT[] ORDER BY id) FROM docs WHERE id IN (7, 23, 91));
+
+query I
+SELECT (SELECT list_sort(list([query_no, idx])) FROM mlx_vss_search_batch('docs', getvariable('qs'), 5)) =
+       (SELECT list_sort(list([qno, id]))
+        FROM (VALUES (0::BIGINT, 7), (1, 23), (2, 91)) qs(qno, qid),
+             LATERAL (SELECT id FROM docs
+                      ORDER BY array_cosine_similarity(emb, (SELECT emb FROM docs WHERE id = qid)) DESC
+                      LIMIT 5));
+----
+true
+
+# Re-pinning replaces the matrix
+query I
+SELECT mlx_vss_pin('docs', list(emb ORDER BY id)) FROM docs WHERE id < 10;
+----
+10
