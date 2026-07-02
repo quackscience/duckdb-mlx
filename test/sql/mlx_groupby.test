@@ -1,0 +1,100 @@
+# name: test/sql/mlx_groupby.test
+# description: transparent GPU GROUP BY single integer key + SUM(column)
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+CREATE TABLE tg AS
+SELECT (range % 100)::BIGINT AS g, (range * 3)::DOUBLE AS x
+FROM range(500000);
+
+statement ok
+SET mlx_execution = true;
+SET mlx_min_rows = 1000;
+
+query II
+EXPLAIN SELECT g, sum(x) FROM tg GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY.*
+
+statement ok
+SET VARIABLE gpu_total = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_total = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_total') - getvariable('cpu_total')) / abs(getvariable('cpu_total')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# hot cached path: fp32 cache scatter — total within ~1% of CPU double path
+query I
+SELECT abs((SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q) - getvariable('cpu_total')) /
+       abs(getvariable('cpu_total')) < 1e-2;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+statement ok
+SET VARIABLE gpu_chk = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM tg);
+
+statement ok
+SET VARIABLE cpu_chk = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_chk') - getvariable('cpu_chk')) / abs(getvariable('cpu_chk')) < 1e-3;
+----
+true
+
+# plain sum on a large table stays on CPU when cold (scan-bound)
+query II
+EXPLAIN SELECT sum(x) FROM tg;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# GROUP BY + WHERE: CPU filter, GPU group-by (no cache when filtered)
+query II
+EXPLAIN SELECT g, sum(x) FROM tg WHERE g < 50 GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY.*
+
+statement ok
+SET VARIABLE gpu_gb_f = (SELECT sum(s) FROM (SELECT g, sum(x) AS s FROM tg WHERE g < 50 GROUP BY g) q);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_gb_f = (SELECT sum(s) FROM (SELECT g, sum(x) AS s FROM tg WHERE g < 50 GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_gb_f') - getvariable('cpu_gb_f')) / abs(getvariable('cpu_gb_f')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# second query: GPU-resident cache (MLX_GROUPBY_CACHED)
+query II
+EXPLAIN SELECT g, sum(x) FROM tg GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY_CACHED.*
+
+statement ok
+SET VARIABLE gpu_hot = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_hot') - getvariable('cpu_total')) / abs(getvariable('cpu_total')) < 1e-2;
+----
+true

@@ -1,0 +1,53 @@
+# name: test/sql/mlx_cache_incremental.test
+# description: incremental GPU cache columns (alternating subsets)
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+SELECT mlx_cache_clear();
+
+statement ok
+CREATE TABLE t_inc AS
+SELECT range::DOUBLE AS a, (range * 2)::DOUBLE AS b, (range * 3)::DOUBLE AS c
+FROM range(500000);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+# cache column a only
+statement ok
+SELECT sum(a + 0.0) FROM t_inc;
+
+# add column b without invalidating a
+statement ok
+SELECT sum(b + 0.0) FROM t_inc;
+
+# both columns still served from cache (expression warms column a)
+query II
+EXPLAIN SELECT sum(a + 0.0) FROM t_inc;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+query II
+EXPLAIN SELECT sum(b + 0.0) FROM t_inc;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+# add column c
+statement ok
+SELECT sum(c + 0.0) FROM t_inc;
+
+statement ok
+SET VARIABLE gpu_multi = (SELECT sum(a + b + c) FROM t_inc);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_multi = (SELECT sum(a + b + c) FROM t_inc);
+
+query I
+SELECT abs(getvariable('gpu_multi') - getvariable('cpu_multi')) / abs(getvariable('cpu_multi')) < 1e-3;
+----
+true

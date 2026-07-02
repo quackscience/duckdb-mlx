@@ -132,8 +132,19 @@ std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, si
 // GPU-resident column cache — the GQE "in-memory table format" analog. The
 // first intercepted query over a table populates it; subsequent queries are
 // served entirely from GPU-resident columns with no table scan at all.
-// Population is all-or-nothing per table so multi-column programs stay
-// row-aligned across segments.
+// Columns are keyed per storage id; missing columns in a new query are
+// populated incrementally while reusing row-aligned segments already cached.
+
+struct MlxZoneMap {
+	float min_val = 0;
+	float max_val = 0;
+	bool has_null = false;
+};
+
+struct MlxCacheStats {
+	int64_t segments_total = 0;
+	int64_t segments_pruned = 0;
+};
 
 //! Drops every cached column whose key starts with `prefix`.
 void MlxCacheDrop(const std::string &prefix);
@@ -142,17 +153,59 @@ void MlxCacheDrop(const std::string &prefix);
 //! columns come from the same population (row-aligned).
 bool MlxCacheHas(const std::vector<std::string> &keys, int64_t expected_rows);
 
-//! Starts a new population for a table: drops `table_prefix` and returns the
-//! population id to store segments under.
-int64_t MlxCacheBeginPopulation(const std::string &table_prefix);
+//! Plan a cache population: returns which `col_keys` need new segments written.
+//! Drops the whole table when `expected_rows` disagrees with a cached column.
+//! Existing columns with matching rows are left intact (alternating subsets).
+struct MlxPopulationPlan {
+	int64_t population = 0;
+	std::vector<bool> store_col;
+};
 
-//! Appends one row-aligned segment for all of `col_keys` (same order as
-//! `cols`).
+MlxPopulationPlan MlxCacheBeginPopulation(const std::string &table_prefix, const std::vector<std::string> &col_keys,
+                                          int64_t expected_rows);
+
+//! Appends one row-aligned segment. Only columns with `store_col[i] == true` are
+//! written; others are skipped (already resident).
 void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &col_keys,
-                          const std::vector<MlxColumnData> &cols, size_t count);
+                          const std::vector<bool> &store_col, const std::vector<MlxColumnData> &cols, size_t count);
 
 //! Evaluates aggregate programs over cached columns, entirely GPU-resident.
+//! Partition-level zone maps prune segments before kernel launch when the WHERE
+//! clause is a conjunction of column-vs-constant comparisons.
 std::vector<MlxSumResult> MlxSumExprsCached(const std::vector<std::string> &col_keys,
                                             const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+
+//! Stats from the most recent cached evaluation (segment pruning).
+MlxCacheStats MlxCacheLastStats();
+
+//! Zone maps per segment for a cached column (empty when unknown).
+std::vector<MlxZoneMap> MlxCacheColumnZoneMaps(const std::string &col_key);
+
+//! Clears the GPU column cache (all tables). For tests.
+void MlxCacheClearAll();
+
+// GROUP BY hash / sort aggregation (Tier B + MLX scatter_add).
+
+struct MlxGroupbyRow {
+	int64_t key;
+	double sum;
+	int64_t count;
+};
+
+//! GPU group-by sum on int64 keys and fp32 values. `use_hash` selects the open-
+//! addressing Metal kernel; otherwise uses argsort + scatter_add (fast for
+//! moderate cardinality).
+std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *values, const uint8_t *valid, size_t count,
+                                        bool use_hash = false);
+
+//! Incremental perfect-hash table update while populating the GPU cache.
+void MlxGroupbyDenseAccumulateHost(const std::string &group_col_key, const std::string &value_col_key,
+                                   int64_t population, const float *group_values, const float *sum_values, size_t count);
+
+//! Group-by over GPU-resident cache columns; reads incremental dense table when available.
+std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key, const std::string &value_col_key);
+
+//! Benchmark helper: returns total sum of per-group sums (checksum).
+double MlxGroupbyBenchSum(const int64_t *keys, const double *values, size_t count, bool use_hash);
 
 } // namespace duckdb_mlx

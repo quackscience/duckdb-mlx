@@ -129,6 +129,88 @@ static void MlxExprBenchFun(DataChunk &args, ExpressionState &state, Vector &res
 #endif
 }
 
+//! mlx_cache_stats() — [segments_total, segments_pruned] from the last cached
+//! GPU aggregate (partition-level zone-map pruning).
+static void MlxCacheStatsFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto stats = duckdb_mlx::MlxCacheLastStats();
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto list_data = ConstantVector::GetData<list_entry_t>(result);
+	list_data[0].offset = 0;
+	list_data[0].length = 2;
+	auto &child = ListVector::GetEntry(result);
+	child.SetVectorType(VectorType::FLAT_VECTOR);
+	auto child_data = FlatVector::GetData<int64_t>(child);
+	child_data[0] = stats.segments_total;
+	child_data[1] = stats.segments_pruned;
+	ListVector::SetListSize(result, 2);
+#else
+	throw NotImplementedException("mlx_cache_stats requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
+//! mlx_cache_clear() — drops the entire GPU column cache (tests).
+static void MlxCacheClearFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	duckdb_mlx::MlxCacheClearAll();
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto result_data = ConstantVector::GetData<string_t>(result);
+	result_data[0] = StringVector::AddString(result, "ok");
+#else
+	throw NotImplementedException("mlx_cache_clear requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
+//! mlx_groupby_bench(keys, values [, use_hash]) — GPU group-by sum spike; returns
+//! checksum of per-group sums for timing comparisons vs CPU.
+static void MlxGroupbyBenchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto count = args.size();
+	auto &keys_vec = args.data[0];
+	auto &vals_vec = args.data[1];
+	bool use_hash = false;
+	if (args.ColumnCount() >= 3) {
+		use_hash = args.data[2].GetValue(0).GetValue<bool>();
+	}
+
+	UnifiedVectorFormat kdata;
+	keys_vec.ToUnifiedFormat(count, kdata);
+	auto key_entries = UnifiedVectorFormat::GetData<list_entry_t>(kdata);
+	auto &key_child = ListVector::GetEntry(keys_vec);
+	key_child.Flatten(ListVector::GetListSize(keys_vec));
+	auto key_data = FlatVector::GetData<int64_t>(key_child);
+
+	UnifiedVectorFormat vdata;
+	vals_vec.ToUnifiedFormat(count, vdata);
+	auto val_entries = UnifiedVectorFormat::GetData<list_entry_t>(vdata);
+	auto &val_child = ListVector::GetEntry(vals_vec);
+	val_child.Flatten(ListVector::GetListSize(vals_vec));
+	auto val_data = FlatVector::GetData<int64_t>(val_child);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<double>(result);
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto ki = kdata.sel->get_index(i);
+		auto vi = vdata.sel->get_index(i);
+		if (!kdata.validity.RowIsValid(ki) || !vdata.validity.RowIsValid(vi)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+		auto ke = key_entries[ki];
+		auto ve = val_entries[vi];
+		vector<double> vals(ve.length);
+		for (idx_t j = 0; j < ve.length; j++) {
+			vals[j] = static_cast<double>(val_data[ve.offset + j]);
+		}
+		result_data[i] = duckdb_mlx::MlxGroupbyBenchSum(key_data + ke.offset, vals.data(), ke.length, use_hash);
+	}
+#else
+	throw NotImplementedException("mlx_groupby_bench requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
 static void SetLogLevel(ClientContext &context, SetScope scope, Value &parameter) {
 	if (!duckdb_mlx::SetLogLevel(StringValue::Get(parameter))) {
 		throw InvalidInputException("mlx_log_level must be one of trace|debug|info|warn|error|critical|off");
@@ -154,6 +236,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("mlx_sum", {LogicalType::LIST(LogicalType::BIGINT)}, LogicalType::BIGINT, MlxSumFun));
 	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
 	                                       LogicalType::DOUBLE, MlxExprBenchFun));
+	loader.RegisterFunction(ScalarFunction("mlx_cache_stats", {}, LogicalType::LIST(LogicalType::BIGINT),
+	                                       MlxCacheStatsFun));
+	loader.RegisterFunction(ScalarFunction("mlx_cache_clear", {}, LogicalType::VARCHAR, MlxCacheClearFun));
+	loader.RegisterFunction(ScalarFunction("mlx_groupby_bench",
+	                                       {LogicalType::LIST(LogicalType::BIGINT),
+	                                        LogicalType::LIST(LogicalType::BIGINT)},
+	                                       LogicalType::DOUBLE, MlxGroupbyBenchFun));
+	loader.RegisterFunction(ScalarFunction("mlx_groupby_bench",
+	                                       {LogicalType::LIST(LogicalType::BIGINT),
+	                                        LogicalType::LIST(LogicalType::BIGINT), LogicalType::BOOLEAN},
+	                                       LogicalType::DOUBLE, MlxGroupbyBenchFun));
 	RegisterMlxVss(loader);
 #ifdef DUCKDB_MLX_GPU_ENABLED
 	RegisterMlxOptimizer(loader.GetDatabaseInstance());

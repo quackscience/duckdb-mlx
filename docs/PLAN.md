@@ -1,11 +1,37 @@
 # duckdb-mlx — GPU-Accelerated DuckDB on Apple Silicon (Metal / MLX)
 
-**Status:** v0.2 — Phase 0 complete, flagship use-case shipped (see §0)
+**Status:** v0.3 — Phase 1 complete, early Phase 2 (GROUP BY v1, mixed-execution strategy)
 **References:** NVIDIA GQE (rapidsai/gqe, NVIDIA blog Jun 2026), Sirius (sirius-db/sirius)
+**North star:** *Best of both worlds* — DuckDB CPU for what it already wins; MLX GPU for
+compute-dense, resident-data, and native-linear-algebra workloads at scale.
 
 ---
 
 ## 0. Progress Log
+
+### 2026-07-02 (latest) — GROUP BY v1 + incremental dense cache + mixed-execution strategy
+
+- **GROUP BY transparent interception:** `MLX_GROUPBY` / `MLX_GROUPBY_CACHED` for single
+  integer key + `SUM(column)` on `seq_scan`, no `WHERE`. Optimizer reads output types
+  from the aggregate plan; cache keys use storage column ids.
+- **Dense perfect-hash path (O(n)):** `keys - min` → `scatter_add` into a fixed table —
+  DuckDB `PERFECT_HASH_GROUP_BY` equivalent. Replaces the losing O(n log n) argsort path
+  for low-cardinality groups.
+- **Incremental GPU partial aggregates:** during cache population, segments scatter into a
+  persistent dense table per `(group_col, value_col)` pair. Hot `MLX_GROUPBY_CACHED` reads
+  ~G group rows, not N fact rows — **<1 ms vs CPU ~2–5 ms** on 5M rows / 1K groups (M4).
+- **Cold path:** CPU double dense accumulate (accurate); GPU upload only when dense span
+  exceeds host path or hash fallback needed.
+- **Benchmark harness:** `benchmark/bench_minimal.sql` + `run_minimal.sh`; TPC-H runner
+  at `benchmark/tpch/run.sh` (GQE 5-run hot methodology).
+- **Measured (M4 base, minimal bench):** expression SUM 10M hot ~3 ms vs CPU ~19 ms
+  (**~6×**); plain `sum(col)` parity (~2 ms); GROUP BY 5M hot **<1 ms** vs CPU ~5 ms;
+  selective filtered multi-agg parity (compute-then-mask regression confirmed).
+- **166 SQL differential assertions** across 10 test files (up from 109).
+- **Strategy locked (§1.1):** do not intercept CPU-fast shapes; expand MLX scope
+  methodically toward TPC-H via mixed CPU/GPU techniques (§6.4).
+- **Next:** shape-aware cost decline, GROUP BY + WHERE + multi-agg (Q1), VARCHAR dict
+  keys, late masking (Q6), `mlx_pin`, composite-key dense GROUP BY, hash join spike.
 
 ### 2026-07-02 (later) — Phase 1 shipped: transparent 14× via GPU-resident cache + fusion
 
@@ -17,124 +43,149 @@
   a pure source with **no table scan**. Row-count mismatch bypasses + repopulates.
   Populations are all-or-nothing per table so multi-column programs stay row-aligned.
 - **Kernel fusion**: each segment's expression forest goes through `mx::compile`
-  (§ "where the speedup comes from" #2 confirmed): unfused 70 ms → fused 13 ms.
-  Gotcha: constant-valued outputs corrupt `mx::compile`'s output mapping — keep them
-  host-side.
+  (§2 confirmed): unfused 70 ms → fused 13 ms. Gotcha: constant-valued outputs corrupt
+  `mx::compile`'s output mapping — keep them host-side.
 - **Measured (M4 base, 100M rows, hot)**: expression SUM 190 ms → 13 ms (**14×**);
   `sum(x)` 13 ms → 4 ms (fp32 bandwidth floor); cold 0.49 s; CPU nearly idle during GPU
-  queries. 80 differential/fallback assertions green.
-- **Coverage extension (same day):** count/count(*)/avg/min/max on the shared IR, and
+  queries.
+- **Coverage extension:** count/count(*)/avg/min/max on the shared IR, and
   WHERE clauses as GPU masks — both pushed-down table filters (translated + cleared
   from the scan, filter-only columns re-added to the projection) and residual filter
   nodes (comparisons, AND/OR/NOT). Counts exact, filtered expression queries ~2.8×
   (the CPU skips excluded rows' math; we compute-then-mask), multi-aggregate single
-  pass 84 ms vs 115 ms. 109 assertions green. Gotcha: `table_filters` keys are
-  storage column indexes, not `column_ids` positions.
-- Next: GROUP BY via Tier-B kernels, cache eviction/memory budget, per-column-set
-  cache populations (current all-or-nothing populations thrash on alternating column
-  subsets), late-masking for selective filters, custom top-k kernel for VSS batches.
+  pass 84 ms vs 115 ms. Gotcha: `table_filters` keys are storage column indexes, not
+  `column_ids` positions.
+- Segment-level zone-map pruning on cached columns (`mlx_cache_prune.test`).
 
 ### 2026-07-02 — Phase 0 complete + flagship use-case
 
-**Done, all test-gated (26 sqllogictest assertions passing):**
+**Done, all test-gated:**
 - Extension skeleton from template; settings; spdlog via vcpkg; DuckDB pinned v1.5.4.
 - MLX v0.31.2 vendored (`third_party/mlx`, built to `build/mlx-install`, imported
   target). Spike 1 (MLX-in-extension) and spike 2 (DuckDB→GPU data bridge) both **go**:
   `mlx_selftest()` = ok, `mlx_sum()` diffed against CPU over 1M rows.
-- **Isolation constraint discovered:** DuckDB's vendored fmt (namespace `duckdb_fmt`,
-  same `<fmt/...>` include paths/guards) shadows real fmt for all extension targets.
-  Resolution: MLX and spdlog each live in a dedicated static lib with inherited include
-  dirs cleared; DuckDB headers and MLX/spdlog headers never share a TU. This is now the
-  permanent architecture of `bridge/` (and validates §9 Q1: C++ core works, no
-  exception/ABI friction observed).
+- **Isolation constraint discovered:** DuckDB's vendored fmt shadows real fmt for all
+  extension targets. Resolution: MLX and spdlog each live in a dedicated static lib;
+  DuckDB headers and MLX/spdlog headers never share a TU. Permanent architecture of
+  `bridge/`.
 - **Flagship use-case shipped: GPU-resident vector similarity search** (`mlx_vss_pin`,
-  `mlx_vss_search`, `mlx_vss_search_batch`) — the §3.2 resident-cache concept
-  specialized to embeddings. M4 (base, 24 GB), 1M×384 fp32: single query 3.5×
-  (bandwidth floor), 32–128 batched queries **16–17×** vs DuckDB LATERAL brute force.
+  `mlx_vss_search`, `mlx_vss_search_batch`). M4 (base, 24 GB), 1M×384 fp32: single
+  query 3.5× (bandwidth floor), 32–128 batched queries **16–17×** vs DuckDB LATERAL
+  brute force. fp16 pinning supported via `half` parameter.
 
 **Measured platform facts (M4 base) that refine §2:**
-- DuckDB CPU `sum()` runs at ~100 GB/s — full memory bandwidth. Confirmed: scan-bound
-  ops cannot win on GPU; do not chase them.
-- ALU-dense expressions (sin·cos+sqrt): GPU ~3× over CPU net of ingest overhead.
-- The `list()` ingest vehicle costs 4–5× the GPU compute itself — direct plan/scan
+- DuckDB CPU `sum()` runs at ~100 GB/s — full memory bandwidth. Scan-bound ops cannot
+  win on GPU; **do not intercept them.**
+- ALU-dense expressions (sin·cos+sqrt): GPU ~3–14× over CPU depending on scale and cache.
+- The `list()` ingest vehicle costs 4–5× the GPU compute itself — transparent plan
   integration (Phase 1) is where end-to-end wins materialize.
-- MLX `argpartition` appears sort-based on Metal (no gain over argsort at 1M): a custom
-  top-k kernel is a real Tier-B candidate.
-
-**Next, in effort-to-payoff order:**
-1. fp16 pinning for VSS (halves bytes → ~2× across the board; standard for embeddings).
-2. `mlx_vss_pin` from a table scan directly (drop the `list()` vehicle).
-3. Custom top-k Metal kernel (large-Q batches leave time on the table).
-4. Phase 1 optimizer hook (transparent `SCAN→FILTER→PROJ→AGG`), per original roadmap.
+- MLX `argpartition` appears sort-based on Metal (no gain over argsort at 1M): custom
+  top-k kernel is a Tier-B candidate. Dense scatter beats sort for low-cardinality GROUP BY.
+- MLX float64 is **not supported on GPU** — fp32 cache + scatter is the hot path;
+  double accuracy on cold path via host accumulate.
+- Metal open-addressing hash kernel (int64 keys) does not compile with device atomics —
+  dense/scatter path is the production approach for low-cardinality; hash join spike TBD.
 
 ---
 
 ## 1. Vision
 
-`duckdb-mlx` is a loadable DuckDB extension that transparently executes analytical query
-pipelines on the Apple Silicon GPU via Metal and MLX. It ports the *winning concepts* of
-NVIDIA GQE — GPU-friendly columnar layout, per-column lightweight compression with GPU
-decompression, zone-map partition pruning, pipelined chunked execution — and the *winning
-integration model* of Sirius — an optimizer hook that intercepts DuckDB plans and falls
-back silently to CPU for anything unsupported — while removing every CUDA-native component.
+`duckdb-mlx` is a loadable DuckDB extension that **selectively** accelerates analytical
+query pipelines on the Apple Silicon GPU via Metal and MLX. It ports the *winning concepts*
+of NVIDIA GQE — GPU-friendly columnar layout, lightweight compression, zone-map pruning,
+pipelined execution — and the *winning integration model* of Sirius — an optimizer hook
+that intercepts supported DuckDB plans and falls back silently to CPU for everything else —
+while removing every CUDA-native component.
+
+The goal is not a GPU-only database. The goal is the **best of both worlds**: DuckDB's
+mature CPU engine for scans, joins, and perfect-hash micro-kernels; MLX for fused
+expression forests, resident fact-table analytics, incremental partial aggregates, and
+native linear algebra (embeddings, matmul-heavy workloads).
 
 ```sql
 LOAD 'duckdb_mlx';
--- plain SQL now runs on the Apple GPU when supported
-SELECT l_returnflag, sum(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1;
+SET mlx_execution = true;
+
+-- GPU when shape + cost model say so (expression-heavy, cached, compute-dense):
+SELECT sum(l_extendedprice * (1 - l_discount)) FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01';
+
+-- CPU when DuckDB already wins (plain scan, join-heavy, tiny cardinality):
+SELECT sum(l_quantity) FROM lineitem;  -- declines to CPU once shape-aware gate lands
+
 SET mlx_execution = false;  -- per-connection opt-out
 ```
+
+### 1.1 Best of Both Worlds — execution policy
+
+Every query passes through a **capability gate** (can we translate it?) and a **cost
+gate** (should we?). Declining to CPU is a feature, not a failure.
+
+| Signal | Owner | Rationale |
+|--------|-------|-----------|
+| Plain `sum(col)`, `count(*)` on uncached table | **CPU** | ~100 GB/s memory bandwidth; GPU adds overhead |
+| First-pass low-cardinality GROUP BY (small span) | **CPU** | DuckDB `PERFECT_HASH_GROUP_BY` is already ~2 ms |
+| Expression / multi-agg over same scan | **GPU** | `mx::compile` fusion; one pass vs many CPU passes |
+| Repeat query on GPU-resident cache | **GPU** | No scan; fused kernels over fp32 segments |
+| Repeat GROUP BY on cached fact table | **GPU** | Incremental dense partial aggregate; download ~G rows |
+| Highly selective filter + agg | **CPU** (today) | We compute-then-mask; CPU skips excluded rows |
+| Multi-table joins, subqueries, EXISTS | **CPU** | Until hash join lands (Phase 3) |
+| Embedding similarity / batched matmul | **GPU** | Native MLX strength; 16–17× demonstrated |
+| ORDER BY + small LIMIT | **CPU** | Tiny output; sort on GPU rarely pays |
+
+**Evolution principle:** expand MLX scope continuously across every row in §4, but only
+intercept when the cost model predicts a win at realistic scale (large datasets, hot
+cache, compute density). Never regress CPU-fast paths to chase benchmark headlines.
 
 ### Non-goals (v1)
 - Multi-GPU / multi-node execution (irrelevant on Apple Silicon anyway).
 - Windowing, ASOF joins, nested types, full VARCHAR expression coverage.
 - Replacing DuckDB's storage format. We accelerate *execution over* DuckDB/Parquet data.
 - Beating DuckDB on every query. Scan-bound queries share the same memory bandwidth as
-  the CPU on Apple Silicon; the win is in compute-dense operators (joins, group-bys,
-  sorts, expression-heavy projections) and in keeping working sets GPU-resident.
+  the CPU on Apple Silicon; the win is in compute-dense operators and resident caches.
+- GPU-only TPC-H. Mixed execution (§6.4) is how we achieve strong aggregate numbers
+  honestly.
 
 ---
 
 ## 2. Platform Reality Check: Grace Blackwell → Apple Silicon
 
-This is the most important section. GQE's headline gains come from *minimizing and hiding
-CPU→GPU data movement* (NVLink-C2C, Blackwell Decompression Engine, cudaMemcpyBatchAsync).
-On Apple Silicon **there is no discrete transfer**: CPU and GPU share one physical LPDDR
-pool behind one memory controller. Every GQE concept must be re-derived, not copied.
+GQE's headline gains come from *minimizing CPU→GPU data movement*. On Apple Silicon
+**there is no discrete transfer**: CPU and GPU share one physical LPDDR pool. Every GQE
+concept must be re-derived, not copied.
 
 | GQE / Sirius (CUDA) | Purpose there | duckdb-mlx (Metal/MLX) replacement |
 |---|---|---|
-| cuDF relational operators | GPU kernels for join/agg/sort/filter | MLX ops where they map cleanly (elementwise, reductions, argsort, take/gather, scan) + **custom Metal kernels** via `mx.fast.metal_kernel` / raw MSL for hash tables, radix partitioning, string gather |
-| RMM memory pools | Sub-allocator over cudaMalloc | MLX unified allocator + `MTLHeap` for kernel scratch; `MTLResidencySet` (macOS 15+) to keep hot buffers wired |
-| cudaMemcpyBatchAsync + pinned bounce buffers | Hide H2D latency | **Eliminated.** Zero-copy: wrap page-aligned host columns with `newBufferWithBytesNoCopy` / MLX arrays over shared memory. "Transfer" becomes *layout conversion* (DuckDB Vector → dense GPU-friendly column), done lazily and cached |
-| nvCOMP LZ4 + Cascaded, Blackwell Decompression Engine | Compress transfers; capacity | **Cascaded-style GPU decode in Metal** (delta + RLE + bit-pack are embarrassingly parallel and trivially expressible). Skip LZ4-on-GPU in v1 — no DE hardware, byte-serial LZ77 decode is a poor fit for Apple GPUs; rely on DuckDB's own lightweight storage encodings + our cascaded format for the GPU cache |
-| CUDA streams, per-thread default stream | Overlap transfer/decode/compute | MLX streams + Metal command queues. Pipeline stages become: *materialize chunk → decode → compute*, overlapped across DuckDB row groups; far fewer stages needed since stage "H2D" is gone |
-| Substrait plan import (DataFusion producer) | Decouple planner from engine | **Not needed as ingress.** Hook DuckDB's `OptimizerExtension` directly on the logical plan (Sirius pattern) — no substrait extension dependency, no plan serialization round-trip. (Optional substrait consumer later for standalone benchmarking parity with GQE) |
-| io_uring custom Parquet reader | Saturate NVMe → GPU | DuckDB's Parquet reader + our GPU column cache. Apple NVMe + unified memory makes a custom reader low ROI for v1 |
-| Zone maps as cuDF tables in GPU memory | Prune before transfer | Same concept, two tiers: (a) **reuse DuckDB's existing row-group zone maps** during plan binding; (b) build partition-level min/max as MLX arrays for GPU-cached tables so pruning of the *GPU cache* is itself a GPU kernel |
-| CUDA cooperative groups, 64-bit atomics | Hash table build | Metal SIMD-group ops (width 32), threadgroup memory (32 KB), **32-bit atomics only** as the portable baseline → design hash tables around 32-bit slots + tag/verify, or Apple-family-9 (M3/M4) 64-bit atomic paths behind a feature flag |
+| cuDF relational operators | GPU kernels for join/agg/sort/filter | MLX ops (elementwise, reductions, scatter, gather) + **custom Metal kernels** via `mx.fast.metal_kernel` for hash tables, compact, decode |
+| RMM memory pools | Sub-allocator over cudaMalloc | MLX unified allocator + `MTLHeap` scratch; `MTLResidencySet` (macOS 15+) |
+| cudaMemcpyBatchAsync | Hide H2D latency | **Eliminated.** Layout conversion (DuckDB Vector → fp32 column) done lazily and cached |
+| nvCOMP + Blackwell DE | Compress transfers | Cascaded-style GPU decode (Phase 2); skip LZ4-on-GPU in v1 |
+| Substrait plan import | Decouple planner | **Not needed.** `OptimizerExtension` on logical plan (Sirius pattern) |
+| Zone maps in GPU memory | Prune before transfer | DuckDB row-group stats + per-segment zone maps on GPU cache ✅ |
+| 64-bit atomics | Hash table build | 32-bit atomics baseline; dense scatter for low-cardinality GROUP BY ✅ |
 
 ### Where the speedup actually comes from on Apple Silicon
-1. **Compute-dense operators.** Hash joins, grouped aggregation with many groups,
-   multi-key sorts, expression-heavy filters — GPU ALU throughput and latency-hiding
-   beat P-cores even at equal bandwidth.
-2. **Kernel fusion via MLX lazy evaluation.** Whole projection/filter expression trees
-   compile into few kernels (`mx.compile`), vs DuckDB's vector-at-a-time interpretation.
-3. **Resident compressed GPU cache.** Cascaded-encoded columns stay resident; repeated
-   analytical queries skip Parquet decode and DuckDB scan entirely (this is the analog of
-   GQE's "in-memory table format", and where GQE-like multiples become plausible).
-4. **Pruning.** Same 1.4×-class end-to-end win GQE measured, cheap to get by reusing
-   DuckDB metadata.
+1. **Compute-dense operators** — multi-expression aggregates, fused projection/filter
+   trees. Measured **6–14×** on expression SUM (scale- and cache-dependent).
+2. **Kernel fusion via `mx::compile`** — whole expression forests in few kernels.
+3. **Resident GPU cache + incremental partial state** — repeat queries skip scan;
+   dense GROUP BY table built during cache populate. Measured **<1 ms** hot GROUP BY.
+4. **Native linear algebra** — VSS batched matmul **16–17×**.
+5. **Pruning** — segment zone maps skip work before kernel launch.
 
-Honest expectation setting: TPC-H Q1/Q6-style scans → parity to ~2×; join/agg-heavy
-queries on M3/M4 Max class → 2–6× is the realistic target band, not GQE's 25× (which was
-one B200 vs CPU over NVLink with a hardware decompression engine).
+### Where we do not win (confirmed — stay on CPU)
+- Plain `sum(column)` — parity (~2 ms / 10M rows).
+- Selective filter + agg with compute-then-mask — parity vs CPU row skipping.
+- Cold first query — always slower (scan + cache build + first scatter).
+- Join-heavy TPC-H queries — CPU until Phase 3.
+
+Honest expectation: **5–10× on GPU-amenable TPC-H queries** (Q1, Q6, Q14) at SF1 hot
+cache; **parity** on scan-bound queries; **aggregate suite speedup** computed over the
+GPU-amenable subset only (§7).
 
 ---
 
 ## 3. Architecture
-
-Same three-layer decomposition as GQE, re-derived for unified memory.
 
 ```
             ┌────────────────────────────────────────────────┐
@@ -143,280 +194,344 @@ Same three-layer decomposition as GQE, re-derived for unified memory.
             └───────────────┬────────────────────────────────┘
                             │ OptimizerExtension hook (Sirius pattern)
             ┌───────────────▼────────────────────────────────┐
- QUERY      │  Plan Interceptor & Translator                 │
- LAYER      │  • walk LogicalOperator tree                   │
-            │  • supported-subtree detection (greedy maximal)│
-            │  • emit MlxPipeline plan or decline → CPU      │
+ QUERY      │  Plan Interceptor + Cost Model (§1.1)            │
+ LAYER      │  • capability: can we translate this subtree?    │
+            │  • cost: will GPU beat CPU at this scale/shape?  │
+            │  • emit MLX physical op or decline → CPU         │
             └───────────────┬────────────────────────────────┘
             ┌───────────────▼────────────────────────────────┐
- DATA       │  GPU Table Cache ("MlxTableFormat")            │
- LAYER      │  • row groups → fixed partitions (default 1M)  │
-            │  • per-column cascaded encoding (Δ, RLE, pack) │
-            │  • dictionary-encoded strings                  │
-            │  • zone maps (min/max per partition, MLX array)│
-            │  • zero-copy DataChunk ingestion path          │
+ DATA       │  GPU Column Cache ("MlxTableFormat" lite) ✅     │
+ LAYER      │  • fp32 segments keyed catalog.schema.table#col  │
+            │  • zone maps per segment; incremental populate   │
+            │  • incremental dense GROUP BY accumulators ✅    │
+            │  • [planned] cascaded encode, dict strings, LRU  │
             └───────────────┬────────────────────────────────┘
             ┌───────────────▼────────────────────────────────┐
- EXECUTION  │  MLX/Metal Operator Runtime                    │
- LAYER      │  • MLX ops: project, filter, reduce, sort      │
-            │  • MSL kernels: hash build/probe, groupby,     │
-            │    radix partition, decode, selection compact  │
-            │  • stream-pipelined over partitions            │
-            │  • result → DuckDB DataChunks (zero/low copy)  │
+ EXECUTION  │  MLX/Metal Operator Runtime                      │
+ LAYER      │  • Tier A: project, filter, reduce, scatter ✅   │
+            │  • Tier A: mx::compile fusion ✅                 │
+            │  • Tier B: dense groupby scatter ✅              │
+            │  • Tier B: hash join, compact, decode [planned]  │
             └────────────────────────────────────────────────┘
 ```
 
 ### 3.1 Query layer — plan interception
-- Register an `OptimizerExtension` (and/or replace physical plan via
-  `duckdb::Extension` hooks) exactly as Sirius does: inspect the optimized logical plan,
-  find the **maximal supported subtree** rooted as close to the sink as possible.
-- v1 policy: all-or-nothing per query (simpler, Sirius v1 did the same); v2: hybrid
-  plans where a GPU subtree feeds a CPU parent through a bridge operator.
-- Cost gate: skip GPU for tiny inputs (estimated cardinality below threshold, e.g.
-  < 512K rows scanned) — kernel launch + graph eval overhead dominates small queries.
-- `SET mlx_execution = true|false`, `SET mlx_min_rows = N`, `SET mlx_log_level = ...`.
-- **Fallback is sacred:** any unsupported type/operator/expression at translate time →
-  return the plan untouched. Any runtime error (OOM, kernel failure) → re-execute on CPU
-  and log. Correctness beats acceleration, always.
 
-### 3.2 Data layer — MlxTableFormat (the GQE in-memory table, unified-memory edition)
-- **Granularity:** table → row groups (align with DuckDB's 122,880-row row groups where
-  sourcing from native storage; align with Parquet row groups when sourcing Parquet) →
-  fixed-size partitions (tunable, default 1M rows) as the pruning/pipelining unit.
-- **Ingestion paths:**
-  1. *Cold path:* DuckDB table scan feeds DataChunks; we densify + encode into the cache
-     on first GPU query (amortized, like GQE's ~1% load-time zone-map cost).
-  2. *Zero-copy fast path:* for uncompressed, non-null fixed-width DuckDB vectors that
-     are page-aligned, wrap directly (`newBufferWithBytesNoCopy`) without densify.
-  3. *Explicit:* `CALL mlx_pin('lineitem')` to pre-encode and wire a table.
-- **Encodings (per column, chosen by the GQE heuristic pair):** try cascaded
-  (delta → RLE → bit-pack) first, measure ratio; fall back to plain. Ratio thresholds
-  configurable (`mlx_compression_ratio_threshold`, default 1.0, mirroring GQE knobs).
-  Compression here buys *capacity* (bigger-than-DRAM working sets stay cached) and
-  *bandwidth* (scan reads fewer bytes; decode is ALU-cheap on GPU).
-- **Strings:** global-per-column dictionary encoding; joins/group-bys operate on codes;
-  late materialization of payload strings only at the sink. Non-dictionary-friendly
-  VARCHAR columns disqualify the operator subtree in v1 (fallback).
-- **NULLs:** validity bitmask per partition, Arrow-compatible layout, so a future
-  Arrow/cuDF-interchange story is cheap.
-- **Zone maps:** per-partition min/max stored as small MLX arrays; pruning expression is
-  derived from the translated filter predicates and evaluated in one tiny kernel over
-  all partitions (GQE measured ~2.2 ms overhead at 1 TB — ours will be microseconds at
-  our scale).
-- **Eviction:** LRU over partitions with a memory budget
-  (`mlx_max_cache_memory`, default e.g. 50% of `recommendedMaxWorkingSetSize`);
-  compressed partitions evict to "decoded-dropped" state first, then fully.
+**Implemented ✅**
+- `OptimizerExtension` on logical plan; greedy intercept of supported subtrees.
+- Physical operators: `MLX_SUM`, `MLX_SUM_CACHED`, `MLX_GROUPBY`, `MLX_GROUPBY_CACHED`.
+- Settings: `mlx_execution`, `mlx_min_rows` (default 512K), `mlx_log_level`.
+- Translate-time fallback: unsupported shape → plan untouched (CPU runs).
+
+**In progress 🟡**
+- Shape-aware cost decline (plain SUM, first-pass GROUP BY where CPU wins).
+- GROUP BY + WHERE; multi-aggregate GROUP BY (Q1).
+- Composite-key packing for multi-column low-cardinality GROUP BY.
+
+**Planned ❌**
+- Hybrid CPU/GPU plans (GPU fact-table subtree → CPU join parent).
+- Runtime fallback: OOM / kernel failure → transparent CPU re-execution.
+- `mlx_pin('table')` explicit pre-warm.
+
+### 3.2 Data layer — MlxTableFormat
+
+**Implemented ✅**
+- fp32 column segments, row-aligned incremental population.
+- Cache keys `catalog.schema.table#storage_col_id`; population tracking.
+- Per-segment zone maps; prune-before-execute on cached WHERE.
+- Process-lifetime cache singleton; `mlx_cache_clear()` for tests.
+- Incremental dense GROUP BY accumulator per `(group_key, value_key)`.
+
+**Planned ❌**
+- Zero-copy fast path (`newBufferWithBytesNoCopy` for aligned vectors).
+- Cascaded encoding (delta → RLE → bit-pack) + fused decode kernel.
+- Dictionary-encoded VARCHAR columns.
+- LRU eviction / `mlx_max_cache_memory` budget.
+- fp64 value segments for exact SUM on hot path (or host-side double accumulators).
 
 ### 3.3 Execution layer — operators
-Two-tier kernel strategy:
 
-**Tier A — pure MLX graph ops** (get lazy fusion + `mx.compile` for free):
-- Projection & scalar expressions (arithmetic, comparisons, boolean logic, CASE via
-  `mx.where`, casts, date extract via integer math on epoch days).
-- Filter: predicate → boolean mask → `mx.compact`/gather by indices
-  (selection vectors as index arrays).
-- Ungrouped aggregation: `sum/min/max/mean/count` are single reductions.
-- ORDER BY / TOP-N: `mx.argsort` (+ composite key packing for multi-column),
-  `mx.topk` for LIMIT-with-ORDER.
+**Tier A — MLX graph ops (implemented ✅ unless noted)**
+- Projection & scalar expressions (arithmetic, sin/cos/sqrt/abs, casts, comparisons).
+- Filter as GPU mask (compute-then-mask — late compact planned).
+- Ungrouped agg: sum/count/avg/min/max; multi-agg single fused pass.
+- `mx::compile` per cache segment.
 
-**Tier B — custom Metal kernels** (via `mx.fast.metal_kernel` or a small MSL library
-loaded alongside; these are the port of what cuDF/cuCollections provided):
-1. `hash_build` / `hash_probe` — open-addressing, linear probing, 32-bit atomic CAS
-   slots with key-tag verification; bucket-chained overflow for multi-match inner joins.
-2. `groupby_hash` — same table, atomic accumulate for sum/count/min/max;
-   two-phase (partition → per-partition table) when group cardinality is high.
-3. `radix_partition` — for partitioned join/agg when hash table exceeds a size budget.
-4. `cascaded_decode` — fused bit-unpack + RLE-expand + delta-scan (prefix sum) kernel.
-5. `selection_compact` — stream compaction via SIMD-group ballot + prefix sum.
-6. `dict_gather_strings` — late string materialization.
-
-**Join order:** hash join only in v1 (inner, left, semi, anti via mark-join flag column —
-same trick as GQE's `GQE_JOIN_USE_MARK_JOIN`); nested-loop and range joins fall back.
-
-**Pipelining:** per-partition tasks queued on 2–3 MLX streams:
-`decode(p) ∥ compute(p-1) ∥ schedule(p+1)`. This is GQE Figure 3 minus the H2D stage.
-DuckDB's own task scheduler drives the CPU side; one dedicated thread owns Metal
-submission to avoid queue contention.
-
-**Result hand-back:** GPU result partitions are already in unified memory; wrap as
-DuckDB Vectors where layout permits, otherwise one memcpy into a DataChunk. TOP-N /
-aggregates are tiny; large materializations stream chunk-by-chunk.
+**Tier B — custom Metal / dense paths**
+| Kernel | Status | Notes |
+|--------|--------|-------|
+| Dense GROUP BY scatter | ✅ | O(n) perfect-hash; hot path for low cardinality |
+| Incremental dense accumulate | ✅ | Built during cache populate |
+| `groupby_hash` (open addressing) | ❌ | Metal atomic assignment errors; not production |
+| `hash_build` / `hash_probe` | ❌ | Phase 3 join spike |
+| `selection_compact` (late mask) | ❌ | Phase 2 — fixes Q6 selective regression |
+| `cascaded_decode` | ❌ | Phase 2 |
+| `dict_gather_strings` | ❌ | Phase 3 |
+| Custom VSS top-k | ❌ | Phase 2 stretch |
 
 ---
 
-## 4. Operator & Type Coverage Matrix (v1 targets)
+## 4. Operator & Type Coverage Matrix
+
+Legend: ✅ done · 🟡 partial · ❌ not started · — decline to CPU by design
 
 | | INT32/64 | FLOAT/DOUBLE | DECIMAL(≤18) | DATE/TIMESTAMP | VARCHAR (dict) |
 |---|---|---|---|---|---|
-| Filter / Projection | P1 | P1 | P2 (as int64 + scale) | P1 (epoch ints) | P2 (eq/in only) |
-| Ungrouped agg | P1 | P1 | P2 | P1 (min/max) | — |
-| GROUP BY hash agg | P2 | P2 | P2 | P2 | P2 (on codes) |
-| Hash JOIN (inner/semi/anti/left) | P2 | P3 | P3 | P2 | P3 (on codes) |
-| ORDER BY / TOP-N | P2 | P2 | P3 | P2 | P3 |
-| LIMIT / CTE passthrough | P1 | P1 | P1 | P1 | P1 |
+| Filter / Projection | ✅ | ✅ | ❌ | 🟡 epoch via double | ❌ |
+| Ungrouped agg | ✅ | ✅ | ❌ | 🟡 min/max | — |
+| GROUP BY hash agg | 🟡 1 key + SUM | 🟡 1 key + SUM | ❌ | ❌ | ❌ |
+| GROUP BY multi-agg | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Hash JOIN | ❌ | ❌ | ❌ | ❌ | ❌ |
+| ORDER BY / TOP-N | ❌ | ❌ | ❌ | ❌ | ❌ |
+| VSS / embeddings | — | ✅ fp32/fp16 | — | — | — |
 
-(P1/P2/P3 = phase in the roadmap below.) Everything else — WINDOW, nested types,
-LIST/STRUCT, regex, LIKE beyond prefix — declines to CPU. DECIMAL wider than 64-bit,
-HUGEINT: fallback (no 128-bit GPU arithmetic in v1).
+**MLX scope evolution (expand continuously, intercept selectively):**
+
+| Phase | Coverage expansion |
+|-------|-------------------|
+| **2a (now)** | GROUP BY + WHERE; multi-agg GROUP BY; VARCHAR dict keys; late masking; shape-aware decline; composite keys |
+| **2b** | ORDER BY / TOP-N on GPU; cascaded cache encoding; `mlx_pin`; fp64 accum option |
+| **3** | Hash join; hybrid fact+dim plans; string dict end-to-end; semi/anti mark join |
+| **4** | Memory budget; runtime CPU fallback; `mlx_stats()`; community extension packaging |
+| **5+** | WINDOW; DECIMAL128; Parquet-direct GPU decode; hybrid plan bridges; ANE experiments |
+
+Everything outside the matrix — WINDOW, nested types, LIST/STRUCT, regex, LIKE beyond
+prefix — declines to CPU until explicitly added.
 
 ---
 
 ## 5. Repo & Build
 
+**Current layout** (monolithic bridge phase; module split deferred):
+
 ```
 duckdb-mlx/
-├── CMakeLists.txt              # duckdb/extension-template based (like Sirius)
-├── extension_config.cmake
-├── duckdb/                     # submodule, pinned
-├── third_party/
-│   └── mlx/                    # submodule (mlx C++ core) or fetch; evaluate mlx-c
 ├── src/
-│   ├── mlx_extension.cpp       # load/register, settings, optimizer hook
-│   ├── planner/                # logical-plan walker, supported-subtree detection
-│   ├── format/                 # MlxTableFormat: ingest, encode, zone maps, cache
-│   ├── ops/                    # Tier A graph builders (project/filter/agg/sort)
-│   ├── kernels/                # Tier B .metal sources + launch wrappers
-│   │   ├── hash_join.metal
-│   │   ├── groupby.metal
-│   │   ├── cascaded.metal
-│   │   └── compact.metal
-│   ├── exec/                   # pipeline scheduler, streams, fallback runtime
-│   └── bridge/                 # DataChunk ⇄ mlx::array conversion
-├── test/
-│   ├── sql/                    # sqllogictest files (DuckDB harness)
-│   └── cpp/                    # kernel unit tests (catch2)
-├── benchmark/                  # TPC-H harness, GPU-vs-CPU diff runner
-└── docs/
+│   ├── duckdb_mlx_extension.cpp   # load/register, settings, scalar functions
+│   ├── planner/mlx_transparent.cpp # OptimizerExtension + physical operators
+│   ├── bridge/
+│   │   ├── mlx_bridge.cpp         # cache, fusion, VSS bridge, zone maps
+│   │   └── mlx_groupby.cpp        # dense scatter, incremental accumulators
+│   ├── ops/mlx_vss.cpp            # VSS table functions
+│   ├── include/                   # mlx_bridge.hpp, mlx_groupby_detail.hpp, …
+│   ├── format/                    # .gitkeep — cache logic lives in bridge/ for now
+│   ├── kernels/                   # .gitkeep — inline mx.fast.metal_kernel for now
+│   └── exec/                      # .gitkeep
+├── test/sql/                      # 10 sqllogictest files, 166 assertions
+├── benchmark/
+│   ├── bench_minimal.sql          # quick CPU vs GPU snapshot
+│   ├── run_minimal.sh
+│   ├── bench_transparent.sql      # 100M expression SUM
+│   ├── bench_groupby.sql
+│   └── tpch/                      # GQE-style 22-query harness
+└── docs/PLAN.md
 ```
 
-- Language: C++17 (DuckDB requirement) linking `mlx::core`; Metal kernels precompiled
-  to a `.metallib` embedded in the extension binary.
-- Platform gate: macOS 14+ (baseline), feature-flag paths for macOS 15
-  (`MTLResidencySet`) and Apple-family-9 GPUs (M3/M4: 64-bit atomics, if adopted).
-- Toolchain constraint to verify early: DuckDB community extensions build with a
-  specific toolchain; Metal compilation needs Xcode CLT — CI on `macos-14/15` GitHub
-  Actions arm64 runners.
-- License: MIT (matches DuckDB + MLX); Sirius is Apache-2.0 — concepts are fine to
-  port, avoid verbatim code copying or preserve headers if any is adapted.
+- Language: C++17 linking `mlx::core`; Metal via `mx.fast.metal_kernel` inline.
+- Platform: macOS 14+ arm64; CI on GitHub Actions macos arm64 runners.
+- Build: `GEN=ninja make release`; tests: `./build/release/test/unittest "[sql]"`.
+- Benchmark: `./benchmark/run_minimal.sh` or `./benchmark/tpch/run.sh 1`.
 
 ---
 
 ## 6. Phased Roadmap
 
-### Phase 0 — Feasibility spikes (1–2 weeks, throwaway code)
-Kill risks before committing to architecture. Each spike has a go/no-go output.
-1. **MLX-in-extension:** build a trivial DuckDB extension that links mlx::core, creates
-   an array, evals a reduction. Verify no symbol/runtime conflicts (exceptions, RTTI,
-   allocator interplay, extension ABI).
-2. **Zero-copy bridge:** DuckDB flat Vector → `mx::array` without copy; measure
-   copy-vs-nocopy for 1M/16M rows. Decide default ingestion path.
-3. **Hash table kernel:** standalone MSL open-addressing build/probe at 10M/100M keys;
-   measure vs DuckDB CPU join on the same machine. This number decides whether the
-   whole project is worth it — target ≥3× on M-series Max for the raw primitive.
-4. **Cascaded decode kernel:** decode throughput target ≥ 100 GB/s effective on M-Max
-   class (should be easy; it's a few ALU ops per element).
-5. **Threading:** MLX stream submission from DuckDB pipeline threads — contention test.
+### Phase 0 — Feasibility spikes ✅ Complete
 
-### Phase 1 — Skeleton & first transparent query (2–3 weeks)
-- Extension template, settings, logging (spdlog, mirroring Sirius's `SET` knobs).
-- Optimizer hook + plan walker; translate `SCAN → FILTER → PROJ → UNGROUPED AGG` on
-  numeric columns; everything else falls back.
-- Cold-path ingestion (densify to plain uncompressed partitions), no compression yet.
-- sqllogictest suite: every supported query also runs with `mlx_execution=false` and
-  results diffed automatically. **This differential harness is permanent infrastructure.**
-- *Milestone:* TPC-H Q6 (SF1–SF10) runs on GPU end-to-end, correct, and ≥ parity.
+| Spike | Result |
+|-------|--------|
+| MLX-in-extension | ✅ Go |
+| Zero-copy bridge | 🟡 Partial — fp32 densify default; nocopy path not implemented |
+| Hash table kernel | ❌ Join spike not run; groupby Metal hash blocked by atomics |
+| Cascaded decode | ❌ Not started |
+| Threading | 🟡 Implicit via DuckDB pipeline; no contention study |
 
-### Phase 2 — Group-by, sort, pruning, compression (4–6 weeks)
-- `groupby_hash` kernel + composite-key ORDER BY/TOP-N.
-- Zone maps + pruning (reuse DuckDB row-group stats at bind, GPU zone maps for cache).
-- Cascaded encoding + fused decode in the scan pipeline; GQE-style dual-heuristic
-  algorithm selection (plain vs cascaded).
-- Partition pipelining across streams.
-- *Milestone:* TPC-H Q1 competitive; Q6-with-selective-predicates shows pruning win;
-  cache-resident re-runs show ≥2× vs DuckDB hot CPU.
+### Phase 1 — Skeleton & first transparent query ✅ Complete
 
-### Phase 3 — Joins & strings (6–8 weeks; the hard one)
-- `hash_build/probe` with mark-join for semi/anti; radix partitioning fallback for
-  large builds; join-order comes from DuckDB's optimizer (we translate, not re-plan).
-- Dictionary string columns end-to-end (encode at ingest, join/group on codes, late
-  materialize).
-- Runtime fallback: OOM/failed kernel → transparent CPU re-execution.
-- *Milestone:* ≥ 15 of 22 TPC-H queries fully on GPU at SF10–SF100; aggregate speedup
-  reported honestly per query class (the Sirius/GQE comparison chart, Apple edition).
+- Optimizer hook; `SCAN → FILTER → PROJ → UNGROUPED AGG` on numeric columns.
+- GPU column cache; `MLX_SUM_CACHED`; `mx::compile` fusion.
+- Multi-agg, WHERE masks, zone-map pruning.
+- Differential test harness (permanent).
+- VSS flagship (fp16 option).
+- *Milestone:* Q6-shaped queries pass (`tpch_shapes.test`). Real TPC-H Q6 on SF1: pending
+  late masking for selective win.
 
-### Phase 4 — Hardening & release (4 weeks)
-- Memory budget/eviction, `recommendedMaxWorkingSetSize` respect, pressure handling.
-- Concurrency: multiple connections, serialized GPU queue with fair scheduling.
-- Docs, `mlx_stats()` table function (cache contents, prune rates, kernel timings).
-- Community-extension packaging (`INSTALL duckdb_mlx FROM community`).
-- Blog post + benchmark reproduction scripts (Haybarn distribution angle: ship it as a
-  bundled extension there first, where we control the toolchain).
+### Phase 2 — Group-by, masking, TPC-H fact-table path 🟡 In progress (~30%)
+
+**2a — Immediate (TPC-H fact-table wins)**
+- [ ] Shape-aware cost decline (don't intercept plain SUM / CPU-fast GROUP BY cold).
+- [ ] GROUP BY + WHERE (mask → compact → dense scatter).
+- [ ] Multi-aggregate GROUP BY (Q1: 6 aggs in one fused pass).
+- [ ] VARCHAR dictionary keys (`l_returnflag`, `l_linestatus`).
+- [ ] Composite-key dense GROUP BY (pack multi-column low-cardinality keys).
+- [ ] Late masking / `selection_compact` (Q6 selective speedup).
+- [ ] `mlx_pin('lineitem')` pre-warm for benchmark suite.
+
+**2b — Scale & encoding**
+- [ ] Cascaded encoding + fused decode in cache pipeline.
+- [ ] Partition pipelining across MLX streams.
+- [ ] Custom VSS top-k Metal kernel.
+- [ ] Per-column-set cache populations (fix all-or-nothing thrash).
+- [ ] Cache eviction / `mlx_max_cache_memory`.
+
+*Milestones:*
+- TPC-H Q1 + Q6 correct and **5–10× hot** at SF1.
+- GPU-amenable subset aggregate **≥5×** (GQE methodology, §7).
+- Cache-resident re-runs ≥2× vs DuckDB hot CPU on expression workloads ✅ (already 6–14×).
+
+### Phase 3 — Joins, hybrid plans, strings ❌ Not started
+
+- `hash_build` / `hash_probe`; mark join for semi/anti.
+- **Hybrid execution:** GPU lineitem filter+project+cache → CPU hash join to dimensions.
+- Dictionary VARCHAR end-to-end.
+- Runtime CPU fallback on GPU failure.
+- *Milestone:* ≥10 of 22 TPC-H queries use GPU for fact-table portion at SF10; join
+  queries via hybrid decomposition.
+
+### Phase 4 — Hardening & release ❌ Not started
+
+- Memory budget, concurrency, `mlx_stats()`, community extension packaging.
+- Blog + reproduction scripts.
 
 ### Phase 5+ — Stretch
-- Hybrid CPU/GPU plans (GPU subtree bridge operator).
-- Parquet-direct GPU decode (PLAIN/RLE/dictionary pages) — the io_uring-reader analog.
-- WINDOW functions, DECIMAL128 via two-limb arithmetic, ANE experiments for filters.
+
+- Full hybrid CPU/GPU plan bridges.
+- Parquet-direct GPU decode.
+- WINDOW, DECIMAL128, ANE filter experiments.
 - Optional Substrait consumer for GQE-comparable standalone benchmarking.
+
+### 6.4 TPC-H mixed-execution strategy
+
+Goal: **incredible aggregate numbers honestly** — GPU for fact-table analytics, CPU for
+joins and CPU-fast shapes. Do not dilute the speedup metric with queries we never intend
+to accelerate.
+
+```
+Session / benchmark start
+  └─ mlx_pin('lineitem')  [planned] — one-time cold cost, amortized across suite
+
+Per query:
+  ├─ GPU:  lineitem scan shapes (Q1, Q6, Q12, Q14, Q19)
+  │         fused multi-agg, cached, dense GROUP BY, late mask
+  ├─ HYBRID: GPU fact projection + CPU join (Q3, Q5, Q7+)  [Phase 3]
+  └─ CPU:  joins, subqueries, EXISTS, ORDER BY small LIMIT (Q2, Q4, Q15–Q22)
+```
+
+| Query | Primary work | Target engine | Phase |
+|-------|-------------|---------------|-------|
+| **Q1** | lineitem filter + 6 aggs + 2-key GROUP BY | **GPU** | 2a |
+| **Q6** | selective filter + expression SUM | **GPU** (late mask) | 2a |
+| **Q12** | join + CASE GROUP BY | GPU lineitem / CPU join | 2b/3 |
+| **Q14** | join + conditional SUM ratio | **GPU** expr agg | 2a |
+| **Q19** | OR filter + expression SUM | **GPU** | 2a |
+| Q3, Q5, Q7–Q10 | multi-join + GROUP BY | HYBRID | 3 |
+| Q2, Q4, Q11, Q13, Q15–Q22 | joins, subqueries, EXISTS | **CPU** | — |
+
+**Benchmark reporting (§7):** tag each query `GPU` | `HYBRID` | `CPU`; report aggregate
+speedup over GPU-tagged queries only; always report cold separately.
+
+**Target (SF1, hot cache, M4 class):**
+
+| Query | CPU (est.) | GPU hot (target) | Speedup |
+|-------|------------|------------------|---------|
+| Q1 | 200–400 ms | 30–60 ms | 5–10× |
+| Q6 | 50–80 ms | 5–10 ms | 6–10× |
+| Q14 | ~100 ms | ~20 ms | ~5× |
+| GPU subset aggregate | — | — | **5–8×** |
 
 ---
 
 ## 7. Benchmarking Plan
-- **Hardware matrix:** M2 Pro (bandwidth-poor floor), M3/M4 Max (target), M4 Ultra if
-  available. Report GB/s-normalized numbers so results transfer.
-- **Workloads:** TPC-H SF1/SF10/SF100 (SF100 ≈ 30 GB compressed — fits unified memory
-  on 64–128 GB machines, mirroring GQE's "data in CPU memory" setup one level down);
-  ClickBench subset for wide-scan realism.
-- **Baselines:** same-machine DuckDB (all cores), and *always hot-cache averaged over
-  5 runs* to match GQE methodology; report GPU cold (ingest included) separately.
-- **Per-query attribution:** prune rate, bytes decoded, kernel time vs graph-eval
-  overhead — so we know *why* each query wins or loses, GQE-style.
-- Include the standard TPC disclaimer (non-audited, non-comparable).
+
+**Quick snapshot:** `./benchmark/run_minimal.sh` — expression SUM, plain SUM, GROUP BY,
+filtered multi-agg at 10M/5M rows.
+
+**TPC-H:** `./benchmark/tpch/run.sh 1` — 22 queries, 5-run hot average, cold reported
+separately. Runner marks unsupported queries; classify as GPU/HYBRID/CPU per §6.4.
+
+**Methodology (GQE-aligned):**
+- Same-machine DuckDB CPU vs duckdb-mlx GPU.
+- 5 hot-cache runs averaged; cold (ingest + first scatter) reported separately.
+- Aggregate speedup = Σ(CPU_GPU_queries) / Σ(GPU_hot_GPU_queries) — not all 22.
+- Per-query attribution via `mlx_cache_stats()` (segments pruned); kernel timing TBD.
+- Hardware: M4 base (current dev), M3/M4 Max (target), report GB/s-normalized where useful.
+- Standard TPC disclaimer (non-audited, non-comparable).
+
+**Current minimal bench (M4 base, Jul 2026):**
+
+| Workload | CPU | GPU hot | Speedup |
+|----------|-----|---------|---------|
+| Expression SUM 10M | ~19 ms | ~3 ms | ~6× |
+| Plain SUM 10M | ~2 ms | ~2 ms | ~1× (stay CPU) |
+| GROUP BY 5M / 1K groups | ~5 ms | <1 ms | ~5–10× |
+| Filtered count+sum 10M | ~6 ms | ~6 ms | ~1× (fix with late mask) |
 
 ---
 
 ## 8. Risks & Mitigations
 
 | Risk | Likelihood | Mitigation |
-|---|---|---|
-| Shared bandwidth ⇒ scan-bound queries show no win | High | Set expectations up front; lead with join/agg/cache-residency wins; compression recovers effective bandwidth |
-| MLX abstraction overhead (lazy graph eval, allocator) for DB-style kernels | Medium | Tier B kernels bypass MLX graphs; MLX used where fusion pays. Escape hatch: talk raw Metal + keep MLX only as allocator/interop, decided by Phase 0 numbers |
-| 32-bit-atomic hash tables limit key widths | Medium | Tag+verify design; 64-bit path on M3+; radix partitioning caps table sizes |
-| DuckDB internal APIs churn (optimizer hook, Vector internals) | Medium | Pin DuckDB submodule per release; Sirius proves the hook surface is maintainable |
-| macOS GPU watchdog kills long kernels | Medium | Partition-sized kernels (bounded work per dispatch) — the pipelining design already enforces this |
-| String-heavy workloads dominated by dictionary build cost | Medium | Amortize at ingest; fall back when dictionary ratio poor |
-| MLX license/version drift, mlx-c vs C++ API instability | Low | Pin submodule; wrap in thin internal interface (`bridge/`) |
-| Correctness divergence (float reduction order, NULL semantics) | High-impact | Differential test harness from Phase 1; Kahan/pairwise sums for DOUBLE aggs; NULL-mask semantics tested exhaustively |
+|------|------------|------------|
+| Scan-bound queries show no win | High | Shape-aware decline (§1.1); don't benchmark as GPU targets |
+| Compute-then-mask loses on selective filters | High | Late masking / compact before agg (Phase 2a) |
+| fp32 cache accuracy drift | Medium | Host double on cold path; fp64 accum option; tolerance in tests |
+| Metal hash atomics unusable for int64 keys | Confirmed | Dense scatter for low-cardinality; redesign hash for 32-bit slots |
+| MLX float64 not on GPU | Confirmed | fp32 GPU + double host accumulate |
+| Cold query tax hurts first-run UX | High | `mlx_pin`; amortize across session; report hot separately |
+| All-or-nothing cache populations thrash | Medium | Per-column-set populations (Phase 2b) |
+| DuckDB API churn | Medium | Pin submodule; Sirius proves hook surface |
+| Correctness divergence | High-impact | 166 differential assertions; expand with each coverage row in §4 |
 
 ---
 
-## 9. Open Questions (to resolve during Phase 0)
-1. MLX C++ core directly vs `mlx-c`? (C++ likely, but check exception/ABI friction
-   inside DuckDB extension loading.)
-2. Consume DuckDB **logical** plan (more stable, we do physical decisions) vs
-   **physical** plan (closer to execution, more churn)? Sirius intercepts at optimizer
-   level → logical. Default: logical.
-3. Partition size: 1M rows vs matching DuckDB's 122,880-row row group (GQE default was
-   10M at 1 TB scale — ours should be smaller; tune in Phase 2).
-4. Should the GPU cache persist across connections (process-lifetime singleton, like
-   GQE's task-manager memory pool split from query memory)? Default: yes, with the
-   two-pool split GQE uses (`query memory` vs `table/cache memory`).
-5. Encode Decimal as scaled int64 always, or fall back when scale mismatch in joins?
-6. Do we want a `gpu_processing`-style explicit API (`mlx_query('...')`) in addition to
-   transparent interception, as Sirius offers both? Cheap to add, useful for debugging.
+## 9. Open Questions
+
+| # | Question | Resolution |
+|---|----------|------------|
+| 1 | MLX C++ vs mlx-c? | ✅ C++ via isolated `bridge/` static lib |
+| 2 | Logical vs physical plan? | ✅ Logical (`OptimizerExtension`) |
+| 3 | Partition size? | 🟡 Ad hoc segment sizes from DuckDB vectors; tune in 2b |
+| 4 | Cache persists across connections? | ✅ Process-lifetime singleton |
+| 5 | Decimal as scaled int64? | ❌ Fallback for now |
+| 6 | Explicit `mlx_query()` API? | 🟡 Scalar/bench APIs exist; full SQL passthrough deferred |
+| 7 | When to decline to CPU on cost? | 🟡 §1.1 policy defined; implementation in 2a |
+| 8 | TPC-H aggregate over all 22 vs GPU subset? | ✅ GPU-subset only (§6.4, §7) |
 
 ---
 
 ## 10. Concept Traceability (GQE/Sirius → duckdb-mlx)
 
-| Winner concept | Source | Ported as |
-|---|---|---|
-| Optimizer-hook transparent interception + silent CPU fallback | Sirius | §3.1 Query layer |
-| Extension-template packaging inside DuckDB | Sirius | §5 repo layout |
-| Row-group/partition in-memory table format hiding compression & pruning from executor | GQE | §3.2 MlxTableFormat |
-| Hybrid per-column compression w/ ratio heuristics (Cascaded vs LZ4) | GQE | Cascaded vs plain (LZ4 dropped — no DE hardware) |
-| Zone-map filter pruning pre-execution | GQE | Two-tier pruning (DuckDB stats + GPU zone maps) |
-| Pipelined stage overlap across row groups / streams | GQE | 2-stage decode∥compute pipeline (H2D stage eliminated) |
-| Batched transfers (cudaMemcpyBatchAsync) | GQE | Obsolete under unified memory → batched *layout conversion* on ingest |
-| Perfect-hash join/groupby, mark join for semi/anti | GQE env flags | Tier B kernels, mark-join in Phase 3 |
-| Query-memory vs task-manager-memory pool split | GQE | §9 Q4, cache vs query pools |
-| Hot-cache 5-run TPC-H methodology + honest disclaimer | GQE | §7 benchmarking |
+| Winner concept | Source | Ported as | Status |
+|----------------|--------|-----------|--------|
+| Optimizer-hook interception + CPU fallback | Sirius | §3.1 | ✅ translate-time |
+| Extension-template packaging | Sirius | §5 | ✅ |
+| In-memory table format / GPU cache | GQE | §3.2 | ✅ fp32 lite |
+| Kernel fusion | GQE/MLX | `mx::compile` | ✅ |
+| Zone-map pruning | GQE | Segment zone maps | ✅ |
+| Perfect-hash GROUP BY | GQE | Dense scatter + incremental accum | ✅ hot path |
+| Pipelined decode∥compute | GQE | MLX streams | ❌ Phase 2b |
+| Cascaded compression | GQE | Cascaded encode/decode | ❌ Phase 2b |
+| Hash join + mark join | GQE | Tier B kernels | ❌ Phase 3 |
+| Hybrid CPU/GPU plans | Sirius/GQE | Fact GPU + dim CPU | ❌ Phase 3 |
+| Hot-cache 5-run TPC-H methodology | GQE | §7 | ✅ harness |
+| Best-of-both-worlds cost model | duckdb-mlx | §1.1 | 🟡 policy set; code in 2a |
+
+---
+
+## 11. Current Scorecard
+
+```
+Phase 0  ████████████████████  100%
+Phase 1  ████████████████████  100%
+Phase 2  ██████░░░░░░░░░░░░░░   30%  ← GROUP BY v1, dense cache, zone prune done
+Phase 3  ░░░░░░░░░░░░░░░░░░░░    0%
+Phase 4  ░░░░░░░░░░░░░░░░░░░░    0%
+
+Tests:     166 assertions / 10 SQL files
+Operators: MLX_SUM[_CACHED], MLX_GROUPBY[_CACHED]
+Flagship:  VSS 16–17× batched; expression SUM 6–14× hot; GROUP BY <1 ms hot
+Next:      Q1 path (multi-agg + VARCHAR + WHERE), Q6 late mask, shape-aware decline
+```
+
+**One-liner:** CPU owns bandwidth and joins; MLX owns fused analytics on resident fact
+tables — expand scope continuously, intercept selectively, benchmark honestly.

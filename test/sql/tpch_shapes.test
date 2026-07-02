@@ -1,0 +1,78 @@
+# name: test/sql/tpch_shapes.test
+# description: TPC-H-shaped queries supported by transparent GPU execution
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+SELECT mlx_cache_clear();
+
+# Q6-shaped: selective filter on quantity + ungrouped sum (no GROUP BY yet)
+statement ok
+CREATE TABLE lineitem_q6 AS
+SELECT
+    (range % 50 + 1)::DOUBLE AS l_quantity,
+    (1994 + (range % 365))::DOUBLE AS l_shipdate_ord
+FROM range(2000000);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+statement ok
+SET VARIABLE gpu_q6 = (
+    SELECT sum(l_quantity + 0.0)
+    FROM lineitem_q6
+    WHERE l_quantity < 24.5 AND l_shipdate_ord >= 2191.5 AND l_shipdate_ord < 2556.5
+);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_q6 = (
+    SELECT sum(l_quantity + 0.0)
+    FROM lineitem_q6
+    WHERE l_quantity < 24.5 AND l_shipdate_ord >= 2191.5 AND l_shipdate_ord < 2556.5
+);
+
+query I
+SELECT abs(getvariable('gpu_q6') - getvariable('cpu_q6')) / abs(getvariable('cpu_q6')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# hot re-run from GPU cache
+query II
+EXPLAIN
+SELECT sum(l_quantity + 0.0)
+FROM lineitem_q6
+WHERE l_quantity < 24.5 AND l_shipdate_ord >= 2191.5 AND l_shipdate_ord < 2556.5;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+# Q1 partial shape: multi-aggregate without GROUP BY (full Q1 needs GROUP BY — Phase 2)
+statement ok
+SET VARIABLE gpu_q1_partial = (
+    SELECT [sum(l_quantity), avg(l_quantity), count(*)]
+    FROM lineitem_q6
+    WHERE l_shipdate_ord <= 2400.5
+);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_q1_partial = (
+    SELECT [sum(l_quantity), avg(l_quantity), count(*)]
+    FROM lineitem_q6
+    WHERE l_shipdate_ord <= 2400.5
+);
+
+query I
+SELECT list_max(list_transform(range(3), lambda i:
+       abs(getvariable('gpu_q1_partial')[i+1] - getvariable('cpu_q1_partial')[i+1]) /
+       abs(getvariable('cpu_q1_partial')[i+1]))) < 1e-3;
+----
+true

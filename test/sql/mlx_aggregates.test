@@ -99,7 +99,7 @@ SET mlx_execution = true;
 # hot filtered queries run entirely from the GPU cache (no scan); z is the
 # most recently populated column set
 query II
-EXPLAIN SELECT min(z) FROM ta WHERE z >= 500.5;
+EXPLAIN SELECT min(z + 0.0) FROM ta WHERE z >= 500.5;
 ----
 physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
 
