@@ -196,11 +196,16 @@ struct MlxGroupbyRow {
 //! addressing Metal kernel; otherwise uses argsort + scatter_add (fast for
 //! moderate cardinality).
 std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *values, const uint8_t *valid, size_t count,
-                                        bool use_hash = false);
+                                         bool use_hash = false);
 
 //! Incremental perfect-hash table update while populating the GPU cache.
 void MlxGroupbyDenseAccumulateHost(const std::string &group_col_key, const std::string &value_col_key,
-                                   int64_t population, const float *group_values, const float *sum_values, size_t count);
+                                   int64_t population, const float *group_values, const float *sum_values,
+                                   size_t count);
+
+//! Whether a cached GROUP BY over these columns is provably correct (dense
+//! table ready, or fp32-exact integer keys and no NULLs per zone maps).
+bool MlxGroupbyCachedSafe(const std::string &group_col_key, const std::string &value_col_key);
 
 //! Group-by over GPU-resident cache columns; reads incremental dense table when available.
 std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key, const std::string &value_col_key);

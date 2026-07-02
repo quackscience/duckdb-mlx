@@ -535,8 +535,7 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 			if (cmp < MlxExprOpCode::CMP_LT || cmp > MlxExprOpCode::CMP_NE) {
 				return false;
 			}
-			prune_preds.push_back(
-			    {filter.ops[i].col, cmp, static_cast<float>(filter.ops[i + 1].value)});
+			prune_preds.push_back({filter.ops[i].col, cmp, static_cast<float>(filter.ops[i + 1].value)});
 			i += 3;
 			return true;
 		};
@@ -758,7 +757,8 @@ void DropTableUnlocked(const std::string &prefix) {
 	MlxGroupbyDenseClearTable(prefix);
 }
 
-void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t offset, size_t take, int64_t population) {
+void AppendColumnSlice(MlxCachedColumn &cached, const MlxColumnData &col, size_t offset, size_t take,
+                       int64_t population) {
 	if (take == 0) {
 		return;
 	}
@@ -824,7 +824,7 @@ bool MlxCacheHas(const std::vector<std::string> &keys, int64_t expected_rows) {
 }
 
 MlxPopulationPlan MlxCacheBeginPopulation(const std::string &table_prefix, const std::vector<std::string> &col_keys,
-                                            int64_t expected_rows) {
+                                          int64_t expected_rows) {
 	std::lock_guard<std::mutex> guard(cache_mutex);
 	MlxPopulationPlan plan;
 	plan.store_col.assign(col_keys.size(), true);
@@ -1004,6 +1004,43 @@ void MlxGroupbyDenseAccumulateHost(const std::string &group_col_key, const std::
 	MlxGroupbyDenseAccumulate(group_col_key, value_col_key, population, keys, vals);
 }
 
+//! Whether a cached GROUP BY would be correct: the incremental dense table is
+//! ready, or the cached fp32 columns are provably safe to re-derive exact
+//! int64 keys from (integer keys within fp32-exact range, no NULLs anywhere).
+bool MlxGroupbyCachedSafe(const std::string &group_col_key, const std::string &value_col_key) {
+	int64_t population = -1;
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		auto &store = CacheStore();
+		auto git = store.find(group_col_key);
+		auto vit = store.find(value_col_key);
+		if (git == store.end() || vit == store.end() || git->second.population != vit->second.population ||
+		    git->second.segments.size() != vit->second.segments.size()) {
+			return false;
+		}
+		population = git->second.population;
+	}
+	if (MlxGroupbyDenseReady(group_col_key, value_col_key, population)) {
+		return true;
+	}
+	constexpr float kFp32Exact = 16777216.0f; // 2^24
+	auto group_maps = MlxCacheColumnZoneMaps(group_col_key);
+	if (group_maps.empty()) {
+		return false;
+	}
+	for (auto &zm : group_maps) {
+		if (zm.has_null || zm.min_val < -kFp32Exact || zm.max_val > kFp32Exact) {
+			return false;
+		}
+	}
+	for (auto &zm : MlxCacheColumnZoneMaps(value_col_key)) {
+		if (zm.has_null) {
+			return false;
+		}
+	}
+	return true;
+}
+
 std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key, const std::string &value_col_key) {
 	int64_t population = -1;
 	std::vector<MlxGroupbyRow> dense_rows;
@@ -1015,13 +1052,14 @@ std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key,
 		if (git == store.end() || vit == store.end()) {
 			throw std::runtime_error("GPU cache miss for GROUP BY columns");
 		}
-		if (git->second.segments.size() != vit->second.segments.size()) {
+		if (git->second.population != vit->second.population ||
+		    git->second.segments.size() != vit->second.segments.size()) {
 			throw std::runtime_error("GPU cache segment mismatch for GROUP BY columns");
 		}
 		population = git->second.population;
-		if (MlxGroupbyDenseTryRead(group_col_key, value_col_key, population, dense_rows)) {
-			return dense_rows;
-		}
+	}
+	if (MlxGroupbyDenseTryRead(group_col_key, value_col_key, population, dense_rows)) {
+		return dense_rows;
 	}
 
 	// Fallback: concat GPU segments and scatter (e.g. cache populated without dense acc).
@@ -1051,7 +1089,9 @@ std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key,
 	}
 	mx::array keys = all_keys.size() == 1 ? all_keys[0] : mx::concatenate(all_keys, 0);
 	mx::array vals = all_vals.size() == 1 ? all_vals[0] : mx::concatenate(all_vals, 0);
-	return MlxGroupbySumDenseGpuArrays(keys, vals);
+	// full path (dense window, else sort+scatter) — dense alone returns empty
+	// for wide key spans
+	return MlxGroupbySumArrays(keys, vals, false);
 }
 
 double MlxExprBenchInt64(const int64_t *data, size_t count) {

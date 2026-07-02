@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -21,66 +22,42 @@ namespace {
 
 constexpr int64_t kDenseMaxSpan = 1'048'576; // perfect-hash window (matches DuckDB low-cardinality path)
 
-struct GroupbyHashKernels {
-	mx::fast::CustomKernelFunction build;
-	mx::fast::CustomKernelFunction collect;
-};
-
-const GroupbyHashKernels &HashKernels() {
-	static GroupbyHashKernels kernels = []() {
+//! Open-addressing build kernel. Race-free protocol: a single strong CAS on
+//! the key slot itself decides ownership (0 = empty; keys are biased by +1 on
+//! the host so 0 never collides with a real key), and all accumulation is
+//! atomic into pre-zeroed buffers — there is no claim-then-write window.
+const mx::fast::CustomKernelFunction &HashBuildKernel() {
+	static auto kernel = []() {
 		const std::string build_src = R"(
             uint idx = thread_position_in_grid.x;
             if (idx >= keys_shape[0]) {
                 return;
             }
-            int64_t key = keys[idx];
+            int key = keys[idx];
             float val = values[idx];
             uint cap = static_cast<uint>(capacity[0]);
-            uint h = static_cast<uint>(key ^ (key >> 33));
-            h = (h * 2654435761u) % cap;
+            uint h = (static_cast<uint>(key) * 2654435761u) % cap;
             for (uint probe = 0; probe < cap; ++probe) {
                 uint slot = (h + probe) % cap;
                 int expected = 0;
-                if (atomic_compare_exchange_weak_explicit(
-                        &slot_used[slot], &expected, 1, memory_order_relaxed, memory_order_relaxed)) {
-                    hash_keys[slot] = key;
-                    hash_sums[slot] = val;
-                    hash_counts[slot] = 1;
-                    return;
+                while (!atomic_compare_exchange_weak_explicit(&hash_keys[slot], &expected, key,
+                                                              memory_order_relaxed, memory_order_relaxed)) {
+                    if (expected != 0) {
+                        break; // definitively occupied
+                    }
+                    // spurious failure: expected reloaded as 0, retry this slot
                 }
-                if (hash_keys[slot] == key) {
+                if (expected == 0 || expected == key) {
                     atomic_fetch_add_explicit(&hash_sums[slot], val, memory_order_relaxed);
                     atomic_fetch_add_explicit(&hash_counts[slot], 1, memory_order_relaxed);
                     return;
                 }
             }
         )";
-
-		const std::string collect_src = R"(
-            uint slot = thread_position_in_grid.x;
-            if (slot >= hash_keys_shape[0]) {
-                return;
-            }
-            if (slot_used[slot] == 0) {
-                out_keys[slot] = 0;
-                out_sums[slot] = 0.0f;
-                out_counts[slot] = 0;
-                return;
-            }
-            out_keys[slot] = hash_keys[slot];
-            out_sums[slot] = hash_sums[slot];
-            out_counts[slot] = hash_counts[slot];
-        )";
-
-		return GroupbyHashKernels {
-		    mx::fast::metal_kernel("mlx_groupby_build", {"keys", "values", "capacity"},
-		                           {"hash_keys", "hash_sums", "hash_counts", "slot_used"}, build_src, "", true, true),
-		    mx::fast::metal_kernel("mlx_groupby_collect",
-		                           {"hash_keys", "hash_sums", "hash_counts", "slot_used"},
-		                           {"out_keys", "out_sums", "out_counts"}, collect_src, "", true, false),
-		};
+		return mx::fast::metal_kernel("mlx_groupby_build", {"keys", "values", "capacity"},
+		                              {"hash_keys", "hash_sums", "hash_counts"}, build_src, "", true, true);
 	}();
-	return kernels;
+	return kernel;
 }
 
 uint32_t NextPow2(uint32_t x) {
@@ -189,73 +166,42 @@ std::vector<MlxGroupbyRow> GroupbySumDenseHost(const int64_t *keys, const double
 	return out;
 }
 
-std::vector<MlxGroupbyRow> GroupbySumSortAccurate(mx::array key_arr, const double *host_vals, size_t n) {
-	if (n == 0) {
-		return {};
-	}
-	auto perm = mx::argsort(key_arr);
-	mx::eval(perm);
-	auto perm_ptr = perm.data<int32_t>();
-	auto key_ptr = key_arr.data<int64_t>();
-
-	std::vector<MlxGroupbyRow> out;
-	int64_t cur_key = key_ptr[perm_ptr[0]];
-	double acc = host_vals[perm_ptr[0]];
-	int cnt = 1;
-	for (size_t i = 1; i < n; i++) {
-		auto src = perm_ptr[i];
-		auto key = key_ptr[src];
-		if (key != cur_key) {
-			out.push_back({cur_key, acc, cnt});
-			cur_key = key;
-			acc = host_vals[src];
-			cnt = 1;
-		} else {
-			acc += host_vals[src];
-			cnt++;
-		}
-	}
-	out.push_back({cur_key, acc, cnt});
-	return out;
-}
+std::vector<MlxGroupbyRow> GroupbySumSortScatter(mx::array key_arr, mx::array val_arr);
 
 std::vector<MlxGroupbyRow> GroupbySumHash(mx::array keys, mx::array vals) {
 	auto n = static_cast<int>(keys.shape(0));
 	if (n == 0) {
 		return {};
 	}
+	// the kernel works on +1-biased int32 keys (0 = empty slot); anything
+	// outside that range takes the sort path instead
+	mx::eval({keys, vals});
+	auto kmin = mx::min(keys).item<int64_t>();
+	auto kmax = mx::max(keys).item<int64_t>();
+	if (kmin < 0 || kmax > std::numeric_limits<int32_t>::max() - 2) {
+		return GroupbySumSortScatter(keys, vals);
+	}
+	auto keys32 = mx::astype(mx::add(keys, mx::array(static_cast<int64_t>(1), mx::int64)), mx::int32);
+
 	uint32_t cap = NextPow2(static_cast<uint32_t>(std::max<size_t>(n * 2, 1024)));
 	std::vector<int32_t> cap_host = {static_cast<int32_t>(cap)};
 	mx::array capacity(cap_host.begin(), mx::Shape {1}, mx::int32);
 
-	auto &kernels = HashKernels();
-	auto built = kernels.build({keys, vals, capacity},
-	                           {mx::Shape {static_cast<int>(cap)}, mx::Shape {static_cast<int>(cap)},
-	                            mx::Shape {static_cast<int>(cap)}, mx::Shape {static_cast<int>(cap)}},
-	                           {mx::int64, mx::float32, mx::int32, mx::int32}, std::make_tuple(n, 1, 1),
-	                           std::make_tuple(256, 1, 1), {}, 0.0f, false, mx::Device::gpu);
+	auto built = HashBuildKernel()(
+	    {keys32, vals, capacity},
+	    {mx::Shape {static_cast<int>(cap)}, mx::Shape {static_cast<int>(cap)}, mx::Shape {static_cast<int>(cap)}},
+	    {mx::int32, mx::float32, mx::int32}, std::make_tuple(n, 1, 1), std::make_tuple(256, 1, 1), {}, 0.0f, false,
+	    mx::Device::gpu);
 
-	auto hash_keys = built[0];
-	auto hash_sums = built[1];
-	auto hash_counts = built[2];
-	auto slot_used = built[3];
-
-	auto collected = kernels.collect({hash_keys, hash_sums, hash_counts, slot_used},
-	                                 {mx::Shape {static_cast<int>(cap)}, mx::Shape {static_cast<int>(cap)},
-	                                  mx::Shape {static_cast<int>(cap)}},
-	                                 {mx::int64, mx::float32, mx::int32}, std::make_tuple(static_cast<int>(cap), 1, 1),
-	                                 std::make_tuple(256, 1, 1), {}, std::nullopt, false, mx::Device::gpu);
-
-	mx::eval(collected);
-	auto out_keys = collected[0].data<int64_t>();
-	auto out_sums = collected[1].data<float>();
-	auto out_counts = collected[2].data<int32_t>();
-	auto used = slot_used.data<int32_t>();
+	mx::eval(built);
+	auto hash_keys = built[0].data<int32_t>();
+	auto hash_sums = built[1].data<float>();
+	auto hash_counts = built[2].data<int32_t>();
 
 	std::vector<MlxGroupbyRow> rows;
 	for (uint32_t i = 0; i < cap; i++) {
-		if (used[i]) {
-			rows.push_back({out_keys[i], static_cast<double>(out_sums[i]), out_counts[i]});
+		if (hash_keys[i] != 0) {
+			rows.push_back({static_cast<int64_t>(hash_keys[i]) - 1, static_cast<double>(hash_sums[i]), hash_counts[i]});
 		}
 	}
 	std::sort(rows.begin(), rows.end(), [](const MlxGroupbyRow &a, const MlxGroupbyRow &b) { return a.key < b.key; });
@@ -270,9 +216,16 @@ std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, boo
 	if (!dense.empty() || key_arr.shape(0) == 0) {
 		return dense;
 	}
-	// high-cardinality fallback: sort + scatter (no host perm walk)
+	return GroupbySumSortScatter(key_arr, val_arr);
+}
+
+//! High-cardinality fallback: sort + scatter (no host perm walk).
+std::vector<MlxGroupbyRow> GroupbySumSortScatter(mx::array key_arr, mx::array val_arr) {
 	auto n = static_cast<int>(key_arr.shape(0));
-	if (n <= 1) {
+	if (n == 0) {
+		return {};
+	}
+	if (n == 1) {
 		mx::eval({key_arr, val_arr});
 		return {{key_arr.item<int64_t>(), static_cast<double>(val_arr.item<float>()), 1}};
 	}
@@ -283,7 +236,8 @@ std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, boo
 	auto curr = mx::slice(sk, {1}, {n});
 	auto diff = mx::astype(mx::not_equal(curr, prev), mx::int32);
 	auto boundary = mx::concatenate({mx::array({1}, mx::int32), diff}, 0);
-	auto group_ids = mx::cumsum(boundary, 0);
+	// 0-based group ids: cumsum of [1, d1, d2, ...] starts at 1
+	auto group_ids = mx::subtract(mx::cumsum(boundary, 0), mx::array(1, mx::int32));
 	int g = mx::add(mx::max(group_ids), mx::array({1}, mx::int32)).item<int32_t>();
 	if (g <= 0) {
 		return {};
@@ -316,10 +270,6 @@ std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, boo
 
 } // namespace
 
-std::vector<MlxGroupbyRow> MlxGroupbySumSortAccurate(mx::array key_arr, const double *host_vals, size_t n) {
-	return GroupbySumSortAccurate(key_arr, host_vals, n);
-}
-
 std::vector<MlxGroupbyRow> MlxGroupbySumArrays(mx::array key_arr, mx::array val_arr, bool use_hash) {
 	return PickGpuPath(key_arr, val_arr, use_hash);
 }
@@ -345,6 +295,12 @@ struct DenseGroupbyAcc {
 std::unordered_map<std::string, std::unique_ptr<DenseGroupbyAcc>> &DenseGroupbyStore() {
 	static std::unordered_map<std::string, std::unique_ptr<DenseGroupbyAcc>> store;
 	return store;
+}
+
+//! Guards DenseGroupbyStore across concurrent connections.
+std::mutex &DenseGroupbyMutex() {
+	static std::mutex m;
+	return m;
 }
 
 DenseGroupbyAcc &DenseGroupbyEntry(const std::string &dk) {
@@ -394,6 +350,7 @@ void MlxGroupbyDenseAccumulate(const std::string &group_col_key, const std::stri
 	if (key_arr.shape(0) == 0) {
 		return;
 	}
+	std::lock_guard<std::mutex> guard(DenseGroupbyMutex());
 	auto dk = DenseGroupbyKey(group_col_key, value_col_key);
 	auto &acc = DenseGroupbyEntry(dk);
 	if (acc.population != population) {
@@ -414,11 +371,17 @@ void MlxGroupbyDenseAccumulate(const std::string &group_col_key, const std::stri
 	mx::eval({acc.sums, acc.counts});
 }
 
+bool MlxGroupbyDenseReady(const std::string &group_col_key, const std::string &value_col_key, int64_t population) {
+	std::lock_guard<std::mutex> guard(DenseGroupbyMutex());
+	auto it = DenseGroupbyStore().find(DenseGroupbyKey(group_col_key, value_col_key));
+	return it != DenseGroupbyStore().end() && it->second && it->second->ready && it->second->population == population;
+}
+
 bool MlxGroupbyDenseTryRead(const std::string &group_col_key, const std::string &value_col_key, int64_t population,
                             std::vector<MlxGroupbyRow> &out) {
+	std::lock_guard<std::mutex> guard(DenseGroupbyMutex());
 	auto it = DenseGroupbyStore().find(DenseGroupbyKey(group_col_key, value_col_key));
-	if (it == DenseGroupbyStore().end() || !it->second || !it->second->ready ||
-	    it->second->population != population) {
+	if (it == DenseGroupbyStore().end() || !it->second || !it->second->ready || it->second->population != population) {
 		return false;
 	}
 	out = DenseRowsFromTables(it->second->kmin, it->second->sums, it->second->counts);
@@ -426,6 +389,7 @@ bool MlxGroupbyDenseTryRead(const std::string &group_col_key, const std::string 
 }
 
 void MlxGroupbyDenseClearTable(const std::string &table_prefix) {
+	std::lock_guard<std::mutex> guard(DenseGroupbyMutex());
 	for (auto it = DenseGroupbyStore().begin(); it != DenseGroupbyStore().end();) {
 		if (table_prefix.empty()) {
 			it = DenseGroupbyStore().erase(it);
@@ -442,7 +406,7 @@ void MlxGroupbyDenseClearTable(const std::string &table_prefix) {
 }
 
 std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *values, const uint8_t *valid, size_t count,
-                                        bool use_hash) {
+                                         bool use_hash) {
 	if (count == 0) {
 		return {};
 	}

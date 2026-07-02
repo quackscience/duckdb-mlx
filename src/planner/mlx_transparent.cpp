@@ -6,11 +6,13 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -254,8 +256,8 @@ static void AppendMlxColumn(UnifiedVectorFormat &fmt, idx_t count, vector<float>
 
 //! After a filtered cold scan, warm the GPU cache from an unfiltered table read
 //! so a follow-up MLX_SUM_CACHED can apply cache_filter over full columns.
-static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_prefix,
-                                    const vector<string> &col_keys, int64_t expected_rows) {
+static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_prefix, const vector<string> &col_keys,
+                                    int64_t expected_rows) {
 	if (col_keys.empty() || duckdb_mlx::MlxCacheHas(col_keys, expected_rows)) {
 		return;
 	}
@@ -271,8 +273,7 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 	auto &catalog = Catalog::GetCatalog(context, parts[0]);
 	CatalogTransaction catalog_transaction(catalog, context);
 	auto &schema = catalog.GetSchema(context, parts[1]);
-	auto &table =
-	    schema.GetEntry(catalog_transaction, CatalogType::TABLE_ENTRY, parts[2])->Cast<TableCatalogEntry>();
+	auto &table = schema.GetEntry(catalog_transaction, CatalogType::TABLE_ENTRY, parts[2])->Cast<TableCatalogEntry>();
 
 	vector<StorageIndex> storage_cols;
 	vector<LogicalType> types;
@@ -643,6 +644,9 @@ public:
 class MlxGroupbyGlobalSourceState : public GlobalSourceState {
 public:
 	idx_t offset = 0;
+	//! results for the cached (scan-less) mode, computed once per execution
+	vector<duckdb_mlx::MlxGroupbyRow> cached_rows;
+	bool cached_ready = false;
 };
 
 class MlxGroupbyPhysicalOperator : public PhysicalOperator {
@@ -661,7 +665,6 @@ public:
 	string table_prefix;
 	int64_t expected_rows = 0;
 	bool cached;
-	mutable vector<duckdb_mlx::MlxGroupbyRow> cached_results;
 
 	string GetName() const override {
 		return cached ? "MLX_GROUPBY_CACHED" : "MLX_GROUPBY";
@@ -765,8 +768,7 @@ public:
 			auto vdata = UnifiedVectorFormat::GetData<int64_t>(vfmt);
 			for (idx_t i = 0; i < count; i++) {
 				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] =
-				    vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
+				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
 			}
 			break;
 		}
@@ -774,8 +776,7 @@ public:
 			auto vdata = UnifiedVectorFormat::GetData<int32_t>(vfmt);
 			for (idx_t i = 0; i < count; i++) {
 				auto idx = vfmt.sel->get_index(i);
-				segment.values[base + i] =
-				    vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
+				segment.values[base + i] = vfmt.validity.RowIsValid(idx) ? static_cast<double>(vdata[idx]) : 0.0;
 			}
 			break;
 		}
@@ -816,7 +817,6 @@ public:
 				values.insert(values.end(), segment.values.begin(), segment.values.end());
 			}
 			gstate.results = duckdb_mlx::MlxGroupbySum(keys.data(), values.data(), nullptr, keys.size(), false);
-			cached_results = gstate.results;
 			return SinkFinalizeType::READY;
 		}
 		vector<int64_t> keys;
@@ -826,19 +826,18 @@ public:
 			values.insert(values.end(), segment.values.begin(), segment.values.end());
 		}
 		gstate.results = duckdb_mlx::MlxGroupbySum(keys.data(), values.data(), nullptr, keys.size(), false);
-		cached_results = gstate.results;
 		return SinkFinalizeType::READY;
 	}
 
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
-		if (cached && cached_results.empty()) {
-			cached_results = duckdb_mlx::MlxGroupbySumCached(col_keys[0], col_keys[1]);
-		}
-		auto &results = !cached_results.empty()
-		                    ? cached_results
-		                    : sink_state->Cast<MlxGroupbyGlobalSinkState>().results;
 		auto &source_state = input.global_state.Cast<MlxGroupbyGlobalSourceState>();
+		if (cached && !source_state.cached_ready) {
+			// pure source: never touches sink_state (there is none)
+			source_state.cached_rows = duckdb_mlx::MlxGroupbySumCached(col_keys[0], col_keys[1]);
+			source_state.cached_ready = true;
+		}
+		auto &results = cached ? source_state.cached_rows : sink_state->Cast<MlxGroupbyGlobalSinkState>().results;
 		if (types.size() != 2) {
 			throw InternalException("MLX_GROUPBY: operator types.size=" + std::to_string(types.size()));
 		}
@@ -1242,6 +1241,34 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 	if (group_col < 0 || value_col < 0) {
 		return false;
 	}
+
+	// NULL group keys / values have SQL semantics (NULL group, NULL-skipping
+	// sums) the sink's sentinel encoding does not implement — decline unless
+	// statistics prove both columns NULL-free
+	auto column_may_be_null = [&](int32_t scan_col) {
+		idx_t storage_idx = static_cast<idx_t>(scan_col);
+		if (!get->projection_ids.empty()) {
+			if (static_cast<size_t>(scan_col) >= get->projection_ids.size()) {
+				return true;
+			}
+			storage_idx = get->projection_ids[scan_col];
+		}
+		if (storage_idx >= get->GetColumnIds().size()) {
+			return true;
+		}
+		unique_ptr<BaseStatistics> stats;
+		if (get->function.statistics_extended) {
+			TableFunctionGetStatisticsInput input(get->bind_data.get(), get->GetColumnIds()[storage_idx]);
+			stats = get->function.statistics_extended(context, input);
+		} else if (get->function.statistics) {
+			stats = get->function.statistics(context, get->bind_data.get(),
+			                                 get->GetColumnIds()[storage_idx].GetPrimaryIndex());
+		}
+		return !stats || stats->CanHaveNull();
+	};
+	if (column_may_be_null(group_col) || column_may_be_null(value_col)) {
+		return false;
+	}
 	LogicalType group_type;
 	if (child_proj && group_col >= 0 && static_cast<size_t>(group_col) < child_proj->expressions.size()) {
 		group_type = child_proj->expressions[group_col]->return_type;
@@ -1289,7 +1316,10 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 		auto value_key = storage_key_for_scan_col(value_col);
 		if (!group_key.empty() && !value_key.empty() && !has_filter) {
 			col_keys = {group_key, value_key};
-			cached = duckdb_mlx::MlxCacheHas(col_keys, total_rows);
+			// serving from the cache requires provable correctness: dense
+			// table ready, or fp32-exact NULL-free keys per zone maps
+			cached =
+			    duckdb_mlx::MlxCacheHas(col_keys, total_rows) && duckdb_mlx::MlxGroupbyCachedSafe(group_key, value_key);
 		}
 	}
 
@@ -1535,8 +1565,8 @@ static bool TryInterceptAggregate(ClientContext &context, unique_ptr<LogicalOper
 	bool skip_cache_populate = has_table_filters;
 
 	auto mlx_op = make_uniq<MlxSumLogicalOperator>(agg.aggregate_index, std::move(programs), std::move(agg_types),
-	                                               std::move(cache_filter), std::move(col_keys), std::move(table_prefix),
-	                                               total_rows, cached, skip_cache_populate);
+	                                               std::move(cache_filter), std::move(col_keys),
+	                                               std::move(table_prefix), total_rows, cached, skip_cache_populate);
 	if (!cached) {
 		mlx_op->children.push_back(std::move(agg.children[0]));
 	}
