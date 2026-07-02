@@ -1,0 +1,40 @@
+# name: test/sql/mlx_sum.test
+# description: Phase 0 spike 2 — differential test: GPU reduction over DuckDB data matches CPU
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+CREATE TABLE numbers AS SELECT (range * 7919) % 1000003 AS x FROM range(1000000);
+
+# 1M-row reduction on the GPU must match DuckDB's CPU sum exactly
+query I
+SELECT CASE WHEN mlx_info() LIKE '%gpu=available%'
+            THEN mlx_sum(list(x)) = sum(x)::BIGINT
+            ELSE true END
+FROM numbers;
+----
+true
+
+query I
+SELECT CASE WHEN mlx_info() LIKE '%gpu=available%'
+            THEN mlx_sum([1, 2, 3]::BIGINT[]) = 6
+            ELSE true END;
+----
+true
+
+# empty list sums to zero
+query I
+SELECT CASE WHEN mlx_info() LIKE '%gpu=available%'
+            THEN mlx_sum([]::BIGINT[]) = 0
+            ELSE true END;
+----
+true
+
+# NULL list propagates NULL
+query I
+SELECT CASE WHEN mlx_info() LIKE '%gpu=available%'
+            THEN mlx_sum(NULL::BIGINT[]) IS NULL
+            ELSE true END;
+----
+true

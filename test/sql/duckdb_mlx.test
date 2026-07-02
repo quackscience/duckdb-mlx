@@ -13,7 +13,7 @@ require duckdb_mlx
 
 # Confirm the extension loaded and reports its status
 query I
-SELECT mlx_info() LIKE 'duckdb_mlx gpu=% spdlog=%';
+SELECT mlx_info() LIKE 'duckdb_mlx gpu=% mlx=% spdlog=%';
 ----
 true
 

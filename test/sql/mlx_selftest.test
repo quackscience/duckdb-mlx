@@ -1,0 +1,13 @@
+# name: test/sql/mlx_selftest.test
+# description: Phase 0 spike 1 — MLX executes a computation on the GPU inside the extension
+# group: [sql]
+
+require duckdb_mlx
+
+# On GPU builds mlx_selftest() must return exactly 'ok' (Metal available,
+# default device is the GPU, int64 and float32 reductions correct).
+# On CPU-only builds the CASE short-circuits so the test still passes.
+query I
+SELECT CASE WHEN mlx_info() LIKE '%gpu=available%' THEN mlx_selftest() ELSE 'ok' END;
+----
+ok

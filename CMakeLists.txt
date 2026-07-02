@@ -25,6 +25,20 @@ else()
 endif()
 option(DUCKDB_MLX_ENABLE_GPU "Build the Metal/MLX GPU execution path" ${DUCKDB_MLX_GPU_DEFAULT})
 
+# MLX is Apple-only and not in vcpkg; it is vendored as a submodule and built
+# once into build/mlx-install, then consumed as an imported target.
+if(DUCKDB_MLX_ENABLE_GPU)
+  set(DUCKDB_MLX_INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build/mlx-install)
+  if(NOT EXISTS ${DUCKDB_MLX_INSTALL_DIR})
+    message(STATUS "Building vendored MLX into ${DUCKDB_MLX_INSTALL_DIR} (one-time)")
+    execute_process(COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_mlx.sh RESULT_VARIABLE DUCKDB_MLX_BUILD_RESULT)
+    if(NOT DUCKDB_MLX_BUILD_RESULT EQUAL 0)
+      message(FATAL_ERROR "Vendored MLX build failed — run ./scripts/build_mlx.sh for details")
+    endif()
+  endif()
+  find_package(MLX CONFIG REQUIRED PATHS ${DUCKDB_MLX_INSTALL_DIR} NO_DEFAULT_PATH)
+endif()
+
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/duckdb_mlx_extension.cpp)
@@ -42,6 +56,17 @@ set_target_properties(
 target_include_directories(duckdb_mlx_logger PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
 target_link_libraries(duckdb_mlx_logger PRIVATE spdlog::spdlog)
 
+# src/bridge/ isolates MLX the same way: MLX headers and DuckDB headers never
+# meet in one translation unit; data crosses as raw pointers (unified memory).
+if(DUCKDB_MLX_ENABLE_GPU)
+  add_library(duckdb_mlx_bridge STATIC src/bridge/mlx_bridge.cpp)
+  set_target_properties(
+    duckdb_mlx_bridge PROPERTIES INCLUDE_DIRECTORIES "" CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                                 POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(duckdb_mlx_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
+  target_link_libraries(duckdb_mlx_bridge PRIVATE mlx)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
@@ -56,6 +81,13 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mlx_logger spdlog::spdlo
 if(DUCKDB_MLX_ENABLE_GPU)
   target_compile_definitions(${EXTENSION_NAME} PRIVATE DUCKDB_MLX_GPU_ENABLED)
   target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE DUCKDB_MLX_GPU_ENABLED)
+  target_link_libraries(${EXTENSION_NAME} duckdb_mlx_bridge mlx)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mlx_bridge mlx)
+  install(
+    TARGETS duckdb_mlx_bridge
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 endif()
 
 install(
