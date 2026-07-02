@@ -42,6 +42,16 @@ std::string MlxSelftest() {
 	}
 }
 
+double MlxExprBenchInt64(const int64_t *data, size_t count) {
+	if (count == 0) {
+		return 0;
+	}
+	mx::array a(data, mx::Shape {static_cast<int>(count)}, mx::int64);
+	auto f = mx::astype(a, mx::float32);
+	auto expr = mx::add(mx::multiply(mx::sin(f), mx::cos(f)), mx::sqrt(mx::add(mx::abs(f), mx::array(1.0f))));
+	return static_cast<double>(mx::sum(expr).item<float>());
+}
+
 int64_t MlxSumInt64(const int64_t *data, size_t count) {
 	if (count == 0) {
 		return 0;

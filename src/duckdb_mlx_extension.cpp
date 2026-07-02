@@ -93,6 +93,40 @@ static void MlxSumFun(DataChunk &args, ExpressionState &state, Vector &result) {
 #endif
 }
 
+//! mlx_expr_bench(BIGINT[]) — benchmark-only: ALU-dense fp32 expression on the
+//! GPU (see MlxExprBenchInt64). Not bit-comparable with the CPU fp64 result.
+static void MlxExprBenchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto count = args.size();
+	auto &list_vec = args.data[0];
+
+	UnifiedVectorFormat ldata;
+	list_vec.ToUnifiedFormat(count, ldata);
+	auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(ldata);
+
+	auto &child = ListVector::GetEntry(list_vec);
+	auto child_size = ListVector::GetListSize(list_vec);
+	child.Flatten(child_size);
+	auto child_data = FlatVector::GetData<int64_t>(child);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<double>(result);
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto row_idx = ldata.sel->get_index(i);
+		if (!ldata.validity.RowIsValid(row_idx)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+		auto entry = list_entries[row_idx];
+		result_data[i] = duckdb_mlx::MlxExprBenchInt64(child_data + entry.offset, entry.length);
+	}
+#else
+	throw NotImplementedException("mlx_expr_bench requires a GPU-enabled build of duckdb_mlx");
+#endif
+}
+
 static void SetLogLevel(ClientContext &context, SetScope scope, Value &parameter) {
 	if (!duckdb_mlx::SetLogLevel(StringValue::Get(parameter))) {
 		throw InvalidInputException("mlx_log_level must be one of trace|debug|info|warn|error|critical|off");
@@ -116,6 +150,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("mlx_selftest", {}, LogicalType::VARCHAR, MlxSelftestFun));
 	loader.RegisterFunction(
 	    ScalarFunction("mlx_sum", {LogicalType::LIST(LogicalType::BIGINT)}, LogicalType::BIGINT, MlxSumFun));
+	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
+	                                       LogicalType::DOUBLE, MlxExprBenchFun));
 
 	duckdb_mlx::SetLogLevel("warn");
 	duckdb_mlx::LogDebug(StringUtil::Format("duckdb_mlx loaded (gpu=%s)", MLX_GPU_AVAILABLE ? "true" : "false"));

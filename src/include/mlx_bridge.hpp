@@ -19,4 +19,9 @@ std::string MlxSelftest();
 //! Sums `count` int64 values on the GPU.
 int64_t MlxSumInt64(const int64_t *data, size_t count);
 
+//! Benchmark helper: ALU-dense fused expression sum(sin(x)*cos(x)+sqrt(|x|+1))
+//! in float32 on the GPU. Timing-comparable to the CPU expression, not
+//! bit-comparable (fp32 vs fp64).
+double MlxExprBenchInt64(const int64_t *data, size_t count);
+
 } // namespace duckdb_mlx
