@@ -30,9 +30,10 @@ double MlxExprBenchInt64(const int64_t *data, size_t count);
 // and L2-normalized once at pin time, so search is one matvec + top-k.
 
 //! Copies an N x dim fp32 row-major matrix to a named GPU-resident,
-//! L2-normalized mx::array. Replaces any existing matrix of that name.
+//! L2-normalized mx::array, stored as fp16 when `half` (halves bandwidth,
+//! standard for embeddings). Replaces any existing matrix of that name.
 //! Returns the number of pinned rows.
-int64_t MlxVssPin(const std::string &name, const float *data, int64_t n, int64_t dim);
+int64_t MlxVssPin(const std::string &name, const float *data, int64_t n, int64_t dim, bool half);
 
 struct MlxVssMatch {
 	int64_t index;

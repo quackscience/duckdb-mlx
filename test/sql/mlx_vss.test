@@ -71,6 +71,31 @@ SELECT (SELECT list_sort(list([query_no, idx])) FROM mlx_vss_search_batch('docs'
 ----
 true
 
+# fp16 pinning: same top-5 set as fp64 CPU brute force on well-separated data
+query I
+SELECT mlx_vss_pin('docs16', list(emb ORDER BY id), 'float16') FROM docs;
+----
+100
+
+query I
+SELECT (SELECT list_sort(list(idx)) FROM mlx_vss_search('docs16', getvariable('q'), 5)) =
+       (SELECT list_sort(list(id))
+        FROM (SELECT id FROM docs
+              ORDER BY array_cosine_similarity(emb, getvariable('q')::FLOAT[8]) DESC
+              LIMIT 5));
+----
+true
+
+query I
+SELECT score > 0.999 FROM mlx_vss_search('docs16', getvariable('q'), 1);
+----
+true
+
+statement error
+SELECT mlx_vss_pin('bad', list(emb), 'float8') FROM docs;
+----
+Invalid Input Error: mlx_vss_pin precision must be 'float32' or 'float16', got 'float8'
+
 # Re-pinning replaces the matrix
 query I
 SELECT mlx_vss_pin('docs', list(emb ORDER BY id)) FROM docs WHERE id < 10;

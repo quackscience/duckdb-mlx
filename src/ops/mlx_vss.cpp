@@ -7,15 +7,26 @@
 
 namespace duckdb {
 
-//! mlx_vss_pin(name, list(<FLOAT[N] column>)) — copies the embedding column
-//! into a named GPU-resident, L2-normalized matrix. Returns the row count.
-//! Row i of the pinned matrix is list position i, so pin with a stable order
+//! mlx_vss_pin(name, list(<FLOAT[N] column>) [, precision]) — copies the
+//! embedding column into a named GPU-resident, L2-normalized matrix stored as
+//! 'float32' (default) or 'float16'. Returns the row count. Row i of the
+//! pinned matrix is list position i, so pin with a stable order
 //! (e.g. list(emb ORDER BY id)).
 static void MlxVssPinFun(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef DUCKDB_MLX_GPU_ENABLED
 	auto count = args.size();
 	auto &name_vec = args.data[0];
 	auto &list_vec = args.data[1];
+
+	bool half = false;
+	if (args.ColumnCount() == 3) {
+		auto precision = args.data[2].GetValue(0).ToString();
+		if (precision == "float16") {
+			half = true;
+		} else if (precision != "float32") {
+			throw InvalidInputException("mlx_vss_pin precision must be 'float32' or 'float16', got '%s'", precision);
+		}
+	}
 
 	auto &type = list_vec.GetType();
 	if (type.id() != LogicalTypeId::LIST || ListType::GetChildType(type).id() != LogicalTypeId::ARRAY ||
@@ -57,8 +68,8 @@ static void MlxVssPinFun(DataChunk &args, ExpressionState &state, Vector &result
 			continue;
 		}
 		auto entry = list_entries[list_idx];
-		result_data[i] =
-		    duckdb_mlx::MlxVssPin(names[name_idx].GetString(), float_data + entry.offset * dim, entry.length, dim);
+		result_data[i] = duckdb_mlx::MlxVssPin(names[name_idx].GetString(), float_data + entry.offset * dim,
+		                                       entry.length, dim, half);
 	}
 #else
 	throw NotImplementedException("mlx_vss_pin requires a GPU-enabled build of duckdb_mlx");
@@ -187,8 +198,11 @@ static void MlxVssBatchFun(ClientContext &context, TableFunctionInput &data, Dat
 }
 
 void RegisterMlxVss(ExtensionLoader &loader) {
-	loader.RegisterFunction(
-	    ScalarFunction("mlx_vss_pin", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::BIGINT, MlxVssPinFun));
+	ScalarFunctionSet pin_set("mlx_vss_pin");
+	pin_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::BIGINT, MlxVssPinFun));
+	pin_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::VARCHAR},
+	                                   LogicalType::BIGINT, MlxVssPinFun));
+	loader.RegisterFunction(pin_set);
 
 	TableFunction search("mlx_vss_search",
 	                     {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT},

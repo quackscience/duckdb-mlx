@@ -23,10 +23,13 @@ std::unordered_map<std::string, mx::array> &VssStore() {
 }
 } // namespace
 
-int64_t MlxVssPin(const std::string &name, const float *data, int64_t n, int64_t dim) {
+int64_t MlxVssPin(const std::string &name, const float *data, int64_t n, int64_t dim, bool half) {
 	mx::array m(data, mx::Shape {static_cast<int>(n), static_cast<int>(dim)}, mx::float32);
 	auto norms = mx::sqrt(mx::sum(mx::square(m), {1}, true));
 	auto normalized = mx::divide(m, mx::maximum(norms, mx::array(1e-12f)));
+	if (half) {
+		normalized = mx::astype(normalized, mx::float16);
+	}
 	normalized.eval();
 	std::lock_guard<std::mutex> guard(vss_mutex);
 	VssStore().erase(name);
@@ -55,7 +58,7 @@ std::vector<MlxVssMatch> MlxVssSearch(const std::string &name, const float *quer
 
 	mx::array q(query, mx::Shape {static_cast<int>(dim)}, mx::float32);
 	auto qn = mx::divide(q, mx::maximum(mx::sqrt(mx::sum(mx::square(q))), mx::array(1e-12f)));
-	auto scores = mx::matmul(m, qn);
+	auto scores = mx::astype(mx::matmul(m, mx::astype(qn, m.dtype())), mx::float32);
 	// argpartition is O(N); the k selected rows are ordered on the host
 	auto part = mx::argpartition(mx::negative(scores), static_cast<int>(k - 1), 0);
 	mx::eval({part, scores});
@@ -128,7 +131,7 @@ std::vector<MlxVssBatchMatch> MlxVssSearchBatch(const std::string &name, const f
 	mx::array qm(queries, mx::Shape {static_cast<int>(q), static_cast<int>(dim)}, mx::float32);
 	auto qnorms = mx::sqrt(mx::sum(mx::square(qm), {1}, true));
 	auto qn = mx::divide(qm, mx::maximum(qnorms, mx::array(1e-12f)));
-	auto scores = mx::matmul(qn, mx::transpose(m)); // (Q, N)
+	auto scores = mx::astype(mx::matmul(mx::astype(qn, m.dtype()), mx::transpose(m)), mx::float32); // (Q, N)
 	// argpartition is O(N) per row; each row's k selected entries are ordered
 	// on the host
 	auto part = mx::argpartition(mx::negative(scores), static_cast<int>(k - 1), 1);
