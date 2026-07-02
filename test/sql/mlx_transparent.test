@@ -111,9 +111,9 @@ EXPLAIN SELECT sum(x) FROM t GROUP BY y;
 ----
 physical_plan	<!REGEX>:.*MLX_SUM.*
 
-# unsupported aggregate (avg) declines
+# unsupported aggregate (median) declines
 query II
-EXPLAIN SELECT avg(x) FROM t;
+EXPLAIN SELECT median(x) FROM t;
 ----
 physical_plan	<!REGEX>:.*MLX_SUM.*
 

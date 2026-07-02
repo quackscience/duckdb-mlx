@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -185,10 +186,10 @@ MlxSegment SegmentFromHost(const std::vector<MlxColumnData> &cols, size_t count)
 	return segment;
 }
 
-//! Columns of `program` that carry a validity array in this segment.
-std::vector<int32_t> MaskedCols(const MlxSegment &segment, const MlxSumProgram &program) {
+//! Columns of `cols` that carry a validity array in this segment.
+std::vector<int32_t> MaskedCols(const MlxSegment &segment, const std::vector<int32_t> &cols) {
 	std::vector<int32_t> masked;
-	for (auto col : program.null_cols) {
+	for (auto col : cols) {
 		if (segment.valids[col].has_value()) {
 			masked.push_back(col);
 		}
@@ -196,89 +197,181 @@ std::vector<int32_t> MaskedCols(const MlxSegment &segment, const MlxSumProgram &
 	return masked;
 }
 
-//! Appends the lazy sum graph of every program over one segment, plus a
-//! valid-count graph for NULL-masked programs only — constant-valued outputs
-//! must never enter a compiled graph (mx::compile dedupes them, corrupting
-//! the output mapping); maskless counts are accumulated host-side instead.
-void BuildSumGraphs(const MlxSegment &segment, const std::vector<MlxSumProgram> &programs, std::vector<mx::array> &sums,
-                    std::vector<mx::array> &counts) {
-	for (auto &program : programs) {
-		std::vector<mx::array> stack;
-		for (auto &op : program.ops) {
+//! Whether this program needs a row mask in this segment (WHERE filter or
+//! NULLs in referenced columns).
+bool SegmentHasMask(const MlxSegment &segment, const MlxFilter &filter, const MlxSumProgram &program) {
+	return !filter.ops.empty() || !MaskedCols(segment, filter.null_cols).empty() ||
+	       !MaskedCols(segment, program.null_cols).empty();
+}
+
+bool HasValueGraph(MlxAggKind kind) {
+	return kind != MlxAggKind::COUNT && kind != MlxAggKind::COUNT_STAR;
+}
+
+//! Evaluates a postfix program over the segment's columns.
+mx::array EvalOps(const MlxSegment &segment, const std::vector<MlxExprOp> &ops) {
+	std::vector<mx::array> stack;
+	for (auto &op : ops) {
+		switch (op.code) {
+		case MlxExprOpCode::LOAD_COL:
+			stack.push_back(segment.cols[op.col]);
+			break;
+		case MlxExprOpCode::CONST_VAL:
+			stack.push_back(mx::array(static_cast<float>(op.value)));
+			break;
+		case MlxExprOpCode::NEGATE:
+		case MlxExprOpCode::SIN:
+		case MlxExprOpCode::COS:
+		case MlxExprOpCode::SQRT:
+		case MlxExprOpCode::ABS:
+		case MlxExprOpCode::NOT: {
+			auto a = stack.back();
+			stack.pop_back();
 			switch (op.code) {
-			case MlxExprOpCode::LOAD_COL:
-				stack.push_back(segment.cols[op.col]);
-				break;
-			case MlxExprOpCode::CONST_VAL:
-				stack.push_back(mx::array(static_cast<float>(op.value)));
-				break;
 			case MlxExprOpCode::NEGATE:
+				stack.push_back(mx::negative(a));
+				break;
 			case MlxExprOpCode::SIN:
+				stack.push_back(mx::sin(a));
+				break;
 			case MlxExprOpCode::COS:
+				stack.push_back(mx::cos(a));
+				break;
 			case MlxExprOpCode::SQRT:
-			case MlxExprOpCode::ABS: {
-				auto a = stack.back();
-				stack.pop_back();
-				switch (op.code) {
-				case MlxExprOpCode::NEGATE:
-					stack.push_back(mx::negative(a));
-					break;
-				case MlxExprOpCode::SIN:
-					stack.push_back(mx::sin(a));
-					break;
-				case MlxExprOpCode::COS:
-					stack.push_back(mx::cos(a));
-					break;
-				case MlxExprOpCode::SQRT:
-					stack.push_back(mx::sqrt(a));
-					break;
-				default:
-					stack.push_back(mx::abs(a));
-					break;
-				}
+				stack.push_back(mx::sqrt(a));
+				break;
+			case MlxExprOpCode::ABS:
+				stack.push_back(mx::abs(a));
+				break;
+			default:
+				stack.push_back(mx::logical_not(a));
 				break;
 			}
-			default: {
-				auto b = stack.back();
-				stack.pop_back();
-				auto a = stack.back();
-				stack.pop_back();
-				switch (op.code) {
-				case MlxExprOpCode::ADD:
-					stack.push_back(mx::add(a, b));
-					break;
-				case MlxExprOpCode::SUB:
-					stack.push_back(mx::subtract(a, b));
-					break;
-				case MlxExprOpCode::MUL:
-					stack.push_back(mx::multiply(a, b));
-					break;
-				default:
-					stack.push_back(mx::divide(a, b));
-					break;
-				}
+			break;
+		}
+		default: {
+			auto b = stack.back();
+			stack.pop_back();
+			auto a = stack.back();
+			stack.pop_back();
+			switch (op.code) {
+			case MlxExprOpCode::ADD:
+				stack.push_back(mx::add(a, b));
+				break;
+			case MlxExprOpCode::SUB:
+				stack.push_back(mx::subtract(a, b));
+				break;
+			case MlxExprOpCode::MUL:
+				stack.push_back(mx::multiply(a, b));
+				break;
+			case MlxExprOpCode::DIV:
+				stack.push_back(mx::divide(a, b));
+				break;
+			case MlxExprOpCode::CMP_LT:
+				stack.push_back(mx::less(a, b));
+				break;
+			case MlxExprOpCode::CMP_LE:
+				stack.push_back(mx::less_equal(a, b));
+				break;
+			case MlxExprOpCode::CMP_GT:
+				stack.push_back(mx::greater(a, b));
+				break;
+			case MlxExprOpCode::CMP_GE:
+				stack.push_back(mx::greater_equal(a, b));
+				break;
+			case MlxExprOpCode::CMP_EQ:
+				stack.push_back(mx::equal(a, b));
+				break;
+			case MlxExprOpCode::CMP_NE:
+				stack.push_back(mx::not_equal(a, b));
+				break;
+			default:
+				stack.push_back(op.code == MlxExprOpCode::AND ? mx::logical_and(a, b) : mx::logical_or(a, b));
 				break;
 			}
+			break;
+		}
+		}
+	}
+	return stack.back();
+}
+
+//! AND of the validity arrays of `cols` (empty when none carry NULLs).
+std::optional<mx::array> NullMask(const MlxSegment &segment, const std::vector<int32_t> &cols) {
+	std::optional<mx::array> mask;
+	for (auto col : MaskedCols(segment, cols)) {
+		auto m = mx::astype(*segment.valids[col], mx::bool_);
+		mask = mask.has_value() ? mx::logical_and(*mask, m) : m;
+	}
+	return mask;
+}
+
+std::optional<mx::array> CombineMasks(const std::optional<mx::array> &a, const std::optional<mx::array> &b) {
+	if (!a.has_value()) {
+		return b;
+	}
+	if (!b.has_value()) {
+		return a;
+	}
+	return mx::logical_and(*a, *b);
+}
+
+//! Appends the lazy graphs of every aggregate over one segment: a value graph
+//! (kind-dependent) and, when a row mask exists, a valid-count graph. Layout
+//! per program: [value?][count?]. Constant-valued outputs must never enter a
+//! compiled graph (mx::compile dedupes them, corrupting the output mapping);
+//! maskless counts are accumulated host-side instead.
+void BuildSumGraphs(const MlxSegment &segment, const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
+                    std::vector<mx::array> &outs) {
+	std::optional<mx::array> filter_mask;
+	if (!filter.ops.empty()) {
+		filter_mask = EvalOps(segment, filter.ops);
+	}
+	filter_mask = CombineMasks(filter_mask, NullMask(segment, filter.null_cols));
+
+	for (auto &program : programs) {
+		auto mask = CombineMasks(filter_mask, NullMask(segment, program.null_cols));
+		if (HasValueGraph(program.kind)) {
+			auto expr = EvalOps(segment, program.ops);
+			switch (program.kind) {
+			case MlxAggKind::MIN:
+				outs.push_back(mask.has_value()
+				                   ? mx::min(mx::where(*mask, expr, mx::array(std::numeric_limits<float>::infinity())))
+				                   : mx::min(expr));
+				break;
+			case MlxAggKind::MAX:
+				outs.push_back(mask.has_value()
+				                   ? mx::max(mx::where(*mask, expr, mx::array(-std::numeric_limits<float>::infinity())))
+				                   : mx::max(expr));
+				break;
+			default: // SUM / AVG
+				outs.push_back(mask.has_value() ? mx::sum(mx::where(*mask, expr, mx::array(0.0f))) : mx::sum(expr));
+				break;
 			}
 		}
-		auto expr = stack.back();
-		auto masked_cols = MaskedCols(segment, program);
-		if (masked_cols.empty()) {
-			sums.push_back(mx::sum(expr));
-		} else {
-			auto mask = mx::astype(*segment.valids[masked_cols[0]], mx::bool_);
-			for (size_t i = 1; i < masked_cols.size(); i++) {
-				mask = mx::logical_and(mask, mx::astype(*segment.valids[masked_cols[i]], mx::bool_));
-			}
-			sums.push_back(mx::sum(mx::where(mask, expr, mx::array(0.0f))));
-			counts.push_back(mx::sum(mx::astype(mask, mx::int64)));
+		if (mask.has_value()) {
+			outs.push_back(mx::sum(mx::astype(*mask, mx::int64)));
 		}
 	}
 }
 
 std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
-                                       const std::vector<MlxSumProgram> &programs) {
-	std::vector<MlxSumResult> results(programs.size(), MlxSumResult {0.0, 0});
+                                       const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	std::vector<MlxSumResult> results;
+	for (auto &program : programs) {
+		switch (program.kind) {
+		case MlxAggKind::MIN:
+			results.push_back({std::numeric_limits<double>::infinity(), 0});
+			break;
+		case MlxAggKind::MAX:
+			results.push_back({-std::numeric_limits<double>::infinity(), 0});
+			break;
+		default:
+			results.push_back({0.0, 0});
+			break;
+		}
+	}
+
 	std::vector<mx::array> all;
 	std::vector<const MlxSegment *> evaluated;
 	for (auto &segment : segments) {
@@ -297,7 +390,7 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 		}
 		auto ncols = segment.cols.size();
 		auto count = segment.count;
-		auto fn = [&programs, ncols, &valid_slots, count](const std::vector<mx::array> &ins) {
+		auto fn = [&programs, &filter, ncols, &valid_slots, count](const std::vector<mx::array> &ins) {
 			MlxSegment seg;
 			seg.count = count;
 			seg.cols.assign(ins.begin(), ins.begin() + ncols);
@@ -308,28 +401,45 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 					seg.valids.emplace_back(std::nullopt);
 				}
 			}
-			std::vector<mx::array> sums;
-			std::vector<mx::array> counts;
-			BuildSumGraphs(seg, programs, sums, counts);
-			sums.insert(sums.end(), counts.begin(), counts.end());
-			return sums;
+			std::vector<mx::array> outs;
+			BuildSumGraphs(seg, programs, filter, outs);
+			return outs;
 		};
 		auto outs = mx::compile(fn)(inputs);
 		all.insert(all.end(), outs.begin(), outs.end());
 		evaluated.push_back(&segment);
 	}
 	mx::eval(all);
+
 	size_t cursor = 0;
 	for (auto segment : evaluated) {
 		for (size_t p = 0; p < programs.size(); p++) {
-			results[p].value += static_cast<double>(all[cursor++].item<float>());
-		}
-		for (size_t p = 0; p < programs.size(); p++) {
-			if (MaskedCols(*segment, programs[p]).empty()) {
-				results[p].valid_count += segment->count;
-			} else {
-				results[p].valid_count += all[cursor++].item<int64_t>();
+			auto &program = programs[p];
+			double value = 0;
+			if (HasValueGraph(program.kind)) {
+				value = static_cast<double>(all[cursor++].item<float>());
 			}
+			int64_t count = SegmentHasMask(*segment, filter, program) ? all[cursor++].item<int64_t>() : segment->count;
+			switch (program.kind) {
+			case MlxAggKind::MIN:
+				results[p].value = std::min(results[p].value, value);
+				break;
+			case MlxAggKind::MAX:
+				results[p].value = std::max(results[p].value, value);
+				break;
+			case MlxAggKind::COUNT:
+			case MlxAggKind::COUNT_STAR:
+				break;
+			default: // SUM / AVG
+				results[p].value += value;
+				break;
+			}
+			results[p].valid_count += count;
+		}
+	}
+	for (size_t p = 0; p < programs.size(); p++) {
+		if (programs[p].kind == MlxAggKind::AVG && results[p].valid_count > 0) {
+			results[p].value /= static_cast<double>(results[p].valid_count);
 		}
 	}
 	return results;
@@ -353,13 +463,12 @@ std::unordered_map<std::string, MlxCachedColumn> &CacheStore() {
 } // namespace
 
 std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, size_t count,
-                                      const std::vector<MlxSumProgram> &programs) {
-	if (count == 0) {
-		return std::vector<MlxSumResult>(programs.size(), MlxSumResult {0.0, 0});
-	}
+                                      const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
 	std::vector<MlxSegment> segments;
-	segments.push_back(SegmentFromHost(cols, count));
-	return EvalSegments(segments, programs);
+	if (count > 0) {
+		segments.push_back(SegmentFromHost(cols, count));
+	}
+	return EvalSegments(segments, programs, filter);
 }
 
 void MlxCacheDrop(const std::string &prefix) {
@@ -415,7 +524,7 @@ void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &co
 }
 
 std::vector<MlxSumResult> MlxSumExprsCached(const std::vector<std::string> &col_keys,
-                                            const std::vector<MlxSumProgram> &programs) {
+                                            const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
 	std::vector<MlxSegment> segments;
 	{
 		std::lock_guard<std::mutex> guard(cache_mutex);
@@ -441,7 +550,7 @@ std::vector<MlxSumResult> MlxSumExprsCached(const std::vector<std::string> &col_
 			}
 		}
 	}
-	return EvalSegments(segments, programs);
+	return EvalSegments(segments, programs, filter);
 }
 
 double MlxExprBenchInt64(const int64_t *data, size_t count) {

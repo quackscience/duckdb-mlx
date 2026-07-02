@@ -31,6 +31,15 @@ queries the CPU does ~1 ms of work versus 1.6 CPU-seconds on the CPU engine. Eve
 is verified against DuckDB's own engine by the differential test suite. Reproduce with
 `benchmark/bench_transparent.sql`.
 
+**Transparent coverage so far:** ungrouped `sum` / `count` / `count(*)` / `avg` / `min` /
+`max` over expressions of `+ - * /`, `sin`, `cos`, `sqrt`, `abs`, casts and constants on
+DOUBLE/FLOAT/BIGINT/INTEGER columns — including **WHERE clauses**, which execute as GPU
+masks over the resident columns (both pushed-down comparisons and residual predicates
+with `AND`/`OR`/`NOT`). NULL semantics are honored throughout; anything unsupported
+declines silently to DuckDB's CPU engine, and correctness always wins over speed
+(the GPU pipeline computes in fp32 — counts are exact, floating aggregates agree with
+the CPU engine to ~1e-7 relative in testing).
+
 ## Flagship: GPU-resident vector search
 
 ```sql

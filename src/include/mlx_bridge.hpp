@@ -71,6 +71,16 @@ enum class MlxExprOpCode : uint8_t {
 	COS,
 	SQRT,
 	ABS,
+	// predicates (produce boolean arrays)
+	CMP_LT,
+	CMP_LE,
+	CMP_GT,
+	CMP_GE,
+	CMP_EQ,
+	CMP_NE,
+	AND,
+	OR,
+	NOT,
 };
 
 struct MlxExprOp {
@@ -79,9 +89,28 @@ struct MlxExprOp {
 	double value = 0;
 };
 
+enum class MlxAggKind : uint8_t {
+	SUM,
+	COUNT,
+	COUNT_STAR,
+	AVG,
+	MIN,
+	MAX,
+};
+
 struct MlxSumProgram {
+	MlxAggKind kind = MlxAggKind::SUM;
+	//! Value expression in postfix form; empty for COUNT_STAR
 	std::vector<MlxExprOp> ops;
 	//! Columns whose NULL mask excludes a row from this aggregate
+	std::vector<int32_t> null_cols;
+};
+
+//! WHERE-clause predicate applied to every aggregate (rows where it is false
+//! or NULL are excluded). Empty ops = no filter.
+struct MlxFilter {
+	std::vector<MlxExprOp> ops;
+	//! Columns whose NULL value makes the predicate non-true for that row
 	std::vector<int32_t> null_cols;
 };
 
@@ -92,13 +121,13 @@ struct MlxColumnData {
 
 struct MlxSumResult {
 	double value;
-	int64_t valid_count; // 0 => SQL NULL
+	int64_t valid_count; // 0 => SQL NULL (for COUNT kinds the result itself)
 };
 
-//! Evaluates each program over `count` rows of `cols` and sums the result on
-//! the GPU (fp32), honoring SQL NULL semantics via the programs' null_cols.
+//! Evaluates each aggregate program over `count` rows of `cols` on the GPU
+//! (fp32), honoring SQL NULL semantics and the shared WHERE filter.
 std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, size_t count,
-                                      const std::vector<MlxSumProgram> &programs);
+                                      const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
 
 // GPU-resident column cache — the GQE "in-memory table format" analog. The
 // first intercepted query over a table populates it; subsequent queries are
@@ -122,8 +151,8 @@ int64_t MlxCacheBeginPopulation(const std::string &table_prefix);
 void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &col_keys,
                           const std::vector<MlxColumnData> &cols, size_t count);
 
-//! Evaluates SUM programs over cached columns, entirely GPU-resident.
+//! Evaluates aggregate programs over cached columns, entirely GPU-resident.
 std::vector<MlxSumResult> MlxSumExprsCached(const std::vector<std::string> &col_keys,
-                                            const std::vector<MlxSumProgram> &programs);
+                                            const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
 
 } // namespace duckdb_mlx

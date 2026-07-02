@@ -21,6 +21,11 @@ SELECT sum(x) FROM t;
 SELECT sum(x) FROM t;
 SELECT sum(x) FROM t;
 
+SELECT '=== gpu hot: WHERE as GPU mask + five aggregates ===' AS bench;
+SELECT count(*), avg(x), min(x), max(x), sum(x + 1.0) FROM t WHERE x > 100000.5;
+SELECT count(*), avg(x), min(x), max(x), sum(x + 1.0) FROM t WHERE x > 100000.5;
+SELECT count(*), avg(x), min(x), max(x), sum(x + 1.0) FROM t WHERE x > 100000.5;
+
 SELECT '=== cpu (mlx_execution = false) ===' AS bench;
 SET mlx_execution = false;
 SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
@@ -29,3 +34,5 @@ SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
 SELECT sum(x) FROM t;
 SELECT sum(x) FROM t;
 SELECT sum(x) FROM t;
+SELECT count(*), avg(x), min(x), max(x), sum(x + 1.0) FROM t WHERE x > 100000.5;
+SELECT count(*), avg(x), min(x), max(x), sum(x + 1.0) FROM t WHERE x > 100000.5;

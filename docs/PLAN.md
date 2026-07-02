@@ -23,9 +23,16 @@
 - **Measured (M4 base, 100M rows, hot)**: expression SUM 190 ms → 13 ms (**14×**);
   `sum(x)` 13 ms → 4 ms (fp32 bandwidth floor); cold 0.49 s; CPU nearly idle during GPU
   queries. 80 differential/fallback assertions green.
-- Next: wider coverage on the same machinery (FILTER → masked sums, more aggregates
-  (count/avg/min/max), GROUP BY via Tier-B kernels), cache eviction/memory budget,
-  and the custom top-k kernel for VSS batches.
+- **Coverage extension (same day):** count/count(*)/avg/min/max on the shared IR, and
+  WHERE clauses as GPU masks — both pushed-down table filters (translated + cleared
+  from the scan, filter-only columns re-added to the projection) and residual filter
+  nodes (comparisons, AND/OR/NOT). Counts exact, filtered expression queries ~2.8×
+  (the CPU skips excluded rows' math; we compute-then-mask), multi-aggregate single
+  pass 84 ms vs 115 ms. 109 assertions green. Gotcha: `table_filters` keys are
+  storage column indexes, not `column_ids` positions.
+- Next: GROUP BY via Tier-B kernels, cache eviction/memory budget, per-column-set
+  cache populations (current all-or-nothing populations thrash on alternating column
+  subsets), late-masking for selective filters, custom top-k kernel for VSS batches.
 
 ### 2026-07-02 — Phase 0 complete + flagship use-case
 

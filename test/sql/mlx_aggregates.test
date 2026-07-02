@@ -1,0 +1,116 @@
+# name: test/sql/mlx_aggregates.test
+# description: count/count(*)/avg/min/max and WHERE filters on the GPU, diffed vs CPU
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+CREATE TABLE ta AS
+SELECT ((range * 7919) % 1048573)::DOUBLE AS x,
+       ((range * 13) % 97 + 1)::DOUBLE AS y,
+       CASE WHEN range % 10 = 0 THEN NULL ELSE (range % 1000)::DOUBLE END AS z
+FROM range(2000000);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+# all aggregate kinds in one interception
+query II
+EXPLAIN SELECT count(*), count(z), min(x), max(x), avg(y) FROM ta;
+----
+physical_plan	<REGEX>:.*MLX_SUM.*
+
+# counts are exact (values < 2^24, fp32-safe); NULL-aware
+query II
+SELECT count(*), count(z) FROM ta;
+----
+2000000	1800000
+
+# min/max exact on fp32-representable values
+query II
+SELECT min(x), max(x) FROM ta;
+----
+0.0	1048572.0
+
+# avg within tolerance of CPU
+statement ok
+SET VARIABLE gpu_avg = (SELECT avg(y) FROM ta);
+
+# WHERE as GPU mask: pushed-down constant filter
+statement ok
+SET VARIABLE gpu_fsum = (SELECT sum(x) FROM ta WHERE x > 524288.5);
+
+query I
+SELECT count(*) = 999973 FROM ta WHERE x > 524288.5;
+----
+true
+
+# residual (non-pushable) filter expression
+statement ok
+SET VARIABLE gpu_expr_fsum = (SELECT sum(x) FROM ta WHERE sin(y) > 0.5);
+
+# conjunction of filters
+statement ok
+SET VARIABLE gpu_conj = (SELECT count(*) FROM ta WHERE x > 1000.5 AND x < 900000.5);
+
+# aggregate over all-filtered-out rows is NULL / zero
+query II
+SELECT sum(x) IS NULL, count(*) FROM ta WHERE x < -1.0;
+----
+true	0
+
+# min over NULL-heavy filtered column
+statement ok
+SET VARIABLE gpu_fmin = (SELECT min(z) FROM ta WHERE z >= 500.5);
+
+statement ok
+SET mlx_execution = false;
+
+query I
+SELECT abs(getvariable('gpu_avg') - (SELECT avg(y) FROM ta)) / abs((SELECT avg(y) FROM ta)) < 1e-3;
+----
+true
+
+query I
+SELECT abs(getvariable('gpu_fsum') - (SELECT sum(x) FROM ta WHERE x > 524288.5)) /
+       abs((SELECT sum(x) FROM ta WHERE x > 524288.5)) < 1e-3;
+----
+true
+
+query I
+SELECT abs(getvariable('gpu_expr_fsum') - (SELECT sum(x) FROM ta WHERE sin(y) > 0.5)) /
+       abs((SELECT sum(x) FROM ta WHERE sin(y) > 0.5)) < 1e-3;
+----
+true
+
+query I
+SELECT getvariable('gpu_conj') = (SELECT count(*) FROM ta WHERE x > 1000.5 AND x < 900000.5);
+----
+true
+
+query I
+SELECT getvariable('gpu_fmin') = (SELECT min(z) FROM ta WHERE z >= 500.5);
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# hot filtered queries run entirely from the GPU cache (no scan); z is the
+# most recently populated column set
+query II
+EXPLAIN SELECT min(z) FROM ta WHERE z >= 500.5;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+# unsupported aggregates still decline cleanly
+query II
+EXPLAIN SELECT median(x) FROM ta;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# DISTINCT declines
+query II
+EXPLAIN SELECT count(DISTINCT x) FROM ta;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
