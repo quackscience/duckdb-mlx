@@ -1,0 +1,175 @@
+# name: test/sql/mlx_transparent.test
+# description: Phase 1 — transparent GPU execution of ungrouped SUM aggregations
+# group: [sql]
+
+require duckdb_mlx
+
+statement ok
+CREATE TABLE t AS SELECT ((range * 7919) % 1000003)::DOUBLE AS x, ((range * 13) % 97 + 1)::DOUBLE AS y
+FROM range(2000000);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+# The plan is intercepted: EXPLAIN shows the MLX_SUM operator
+query II
+EXPLAIN SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
+----
+physical_plan	<REGEX>:.*MLX_SUM.*
+
+# Differential: GPU (fp32) result within 1e-3 relative of CPU (fp64)
+statement ok
+SET VARIABLE gpu_result = (SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t);
+
+statement ok
+SET mlx_execution = false;
+
+query II
+EXPLAIN SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+statement ok
+SET VARIABLE cpu_result = (SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t);
+
+query I
+SELECT abs(getvariable('gpu_result') - getvariable('cpu_result')) / abs(getvariable('cpu_result')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# Multiple aggregates in one interception
+statement ok
+SET VARIABLE gpu_multi = (SELECT [sum(x + 1.0), sum(x * 2.0), sum(x / y)] FROM t);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_multi = (SELECT [sum(x + 1.0), sum(x * 2.0), sum(x / y)] FROM t);
+
+query I
+SELECT list_max(list_transform(range(3), lambda i:
+       abs(getvariable('gpu_multi')[i+1] - getvariable('cpu_multi')[i+1]) / abs(getvariable('cpu_multi')[i+1]))) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# NULL semantics: all-NULL sum is NULL; mixed NULLs are excluded per SQL
+statement ok
+CREATE TABLE tn AS SELECT CASE WHEN range % 2 = 0 THEN NULL ELSE range::DOUBLE END AS x FROM range(2000000);
+
+query II
+EXPLAIN SELECT sum(x + 1.0) FROM tn;
+----
+physical_plan	<REGEX>:.*MLX_SUM.*
+
+query I
+SELECT (SELECT sum(x + 0.0) IS NULL FROM (SELECT NULL::DOUBLE AS x FROM range(2000000)) sub);
+----
+true
+
+statement ok
+SET VARIABLE gpu_null = (SELECT sum(x + 1.0) FROM tn);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_null = (SELECT sum(x + 1.0) FROM tn);
+
+query I
+SELECT abs(getvariable('gpu_null') - getvariable('cpu_null')) / abs(getvariable('cpu_null')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# Fallback cases stay on the CPU engine, untouched:
+# small table (below mlx_min_rows)
+statement ok
+CREATE TABLE small AS SELECT range::DOUBLE AS x FROM range(10);
+
+query II
+EXPLAIN SELECT sum(x) FROM small;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+query I
+SELECT sum(x) FROM small;
+----
+45
+
+# GROUP BY is unsupported in Phase 1
+query II
+EXPLAIN SELECT sum(x) FROM t GROUP BY y;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# unsupported aggregate (avg) declines
+query II
+EXPLAIN SELECT avg(x) FROM t;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# unsupported expression (LIKE on varchar) declines
+statement ok
+CREATE TABLE ts AS SELECT range::VARCHAR AS s, range::DOUBLE AS x FROM range(2000000);
+
+query II
+EXPLAIN SELECT sum(CASE WHEN s LIKE '1%' THEN x ELSE 0 END) FROM ts;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# ==== GPU-resident column cache ====
+# t was executed above, so its columns are GPU-resident: the plan has no scan
+query II
+EXPLAIN SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*
+
+# cached result still matches the CPU
+statement ok
+SET VARIABLE gpu_hot = (SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t);
+
+query I
+SELECT abs(getvariable('gpu_hot') - getvariable('cpu_result')) / abs(getvariable('cpu_result')) < 1e-3;
+----
+true
+
+# DML changes the row count: the stale cache is bypassed, plan scans again
+statement ok
+INSERT INTO t VALUES (1.0, 1.0);
+
+query II
+EXPLAIN SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
+----
+physical_plan	<!REGEX>:.*MLX_SUM_CACHED.*
+
+statement ok
+SET VARIABLE gpu_after = (SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_after = (SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t);
+
+query I
+SELECT abs(getvariable('gpu_after') - getvariable('cpu_after')) / abs(getvariable('cpu_after')) < 1e-3;
+----
+true
+
+statement ok
+SET mlx_execution = true;
+
+# and after re-execution the repopulated cache serves again
+query II
+EXPLAIN SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;
+----
+physical_plan	<REGEX>:.*MLX_SUM_CACHED.*

@@ -10,6 +10,7 @@
 
 #ifdef DUCKDB_MLX_GPU_ENABLED
 #include "mlx_bridge.hpp"
+#include "mlx_transparent.hpp"
 #endif
 
 namespace duckdb {
@@ -154,6 +155,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
 	                                       LogicalType::DOUBLE, MlxExprBenchFun));
 	RegisterMlxVss(loader);
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	RegisterMlxOptimizer(loader.GetDatabaseInstance());
+#endif
 
 	duckdb_mlx::SetLogLevel("warn");
 	duckdb_mlx::LogDebug(StringUtil::Format("duckdb_mlx loaded (gpu=%s)", MLX_GPU_AVAILABLE ? "true" : "false"));

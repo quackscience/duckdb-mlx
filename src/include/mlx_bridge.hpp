@@ -55,4 +55,75 @@ struct MlxVssBatchMatch {
 std::vector<MlxVssBatchMatch> MlxVssSearchBatch(const std::string &name, const float *queries, int64_t q, int64_t dim,
                                                 int64_t k);
 
+// Transparent execution (PLAN Phase 1): the planner translates supported
+// DuckDB expression trees into this postfix IR; the bridge evaluates the
+// whole program as one fused MLX graph over column buffers.
+
+enum class MlxExprOpCode : uint8_t {
+	LOAD_COL,  // push column `col`
+	CONST_VAL, // push constant `value`
+	ADD,
+	SUB,
+	MUL,
+	DIV,
+	NEGATE,
+	SIN,
+	COS,
+	SQRT,
+	ABS,
+};
+
+struct MlxExprOp {
+	MlxExprOpCode code;
+	int32_t col = 0;
+	double value = 0;
+};
+
+struct MlxSumProgram {
+	std::vector<MlxExprOp> ops;
+	//! Columns whose NULL mask excludes a row from this aggregate
+	std::vector<int32_t> null_cols;
+};
+
+struct MlxColumnData {
+	const float *values;  // nulls hold 0.0; fp32 conversion happens at sink time
+	const uint8_t *valid; // 1 = valid; nullptr = all valid
+};
+
+struct MlxSumResult {
+	double value;
+	int64_t valid_count; // 0 => SQL NULL
+};
+
+//! Evaluates each program over `count` rows of `cols` and sums the result on
+//! the GPU (fp32), honoring SQL NULL semantics via the programs' null_cols.
+std::vector<MlxSumResult> MlxSumExprs(const std::vector<MlxColumnData> &cols, size_t count,
+                                      const std::vector<MlxSumProgram> &programs);
+
+// GPU-resident column cache — the GQE "in-memory table format" analog. The
+// first intercepted query over a table populates it; subsequent queries are
+// served entirely from GPU-resident columns with no table scan at all.
+// Population is all-or-nothing per table so multi-column programs stay
+// row-aligned across segments.
+
+//! Drops every cached column whose key starts with `prefix`.
+void MlxCacheDrop(const std::string &prefix);
+
+//! True when all keys are cached, row counts equal expected_rows, and all
+//! columns come from the same population (row-aligned).
+bool MlxCacheHas(const std::vector<std::string> &keys, int64_t expected_rows);
+
+//! Starts a new population for a table: drops `table_prefix` and returns the
+//! population id to store segments under.
+int64_t MlxCacheBeginPopulation(const std::string &table_prefix);
+
+//! Appends one row-aligned segment for all of `col_keys` (same order as
+//! `cols`).
+void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &col_keys,
+                          const std::vector<MlxColumnData> &cols, size_t count);
+
+//! Evaluates SUM programs over cached columns, entirely GPU-resident.
+std::vector<MlxSumResult> MlxSumExprsCached(const std::vector<std::string> &col_keys,
+                                            const std::vector<MlxSumProgram> &programs);
+
 } // namespace duckdb_mlx
