@@ -296,14 +296,40 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 	DataChunk chunk;
 	chunk.Initialize(context, types);
 
-	auto append_chunk = [&](DataChunk &scan_chunk) {
-		vector<vector<float>> values(scan_chunk.ColumnCount());
-		vector<vector<uint8_t>> valid(scan_chunk.ColumnCount());
-		auto count = scan_chunk.size();
-		for (idx_t col = 0; col < scan_chunk.ColumnCount(); col++) {
+	// batch scan chunks into large segments — one segment per scan chunk
+	// would mean thousands of tiny GPU graphs per hot query
+	constexpr idx_t kWarmSegmentRows = 8 * 1024 * 1024;
+	vector<vector<float>> values(types.size());
+	vector<vector<uint8_t>> valid(types.size());
+	idx_t buffered = 0;
+
+	auto flush = [&]() {
+		if (buffered == 0) {
+			return;
+		}
+		vector<MlxColumnData> cols;
+		for (idx_t col = 0; col < values.size(); col++) {
+			cols.push_back({values[col].data(), valid[col].empty() ? nullptr : valid[col].data()});
+		}
+		duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, buffered);
+		for (idx_t col = 0; col < values.size(); col++) {
+			values[col].clear();
+			valid[col].clear();
+		}
+		buffered = 0;
+	};
+
+	while (true) {
+		chunk.Reset();
+		data_table.Scan(transaction, chunk, scan_state);
+		auto count = chunk.size();
+		if (count == 0) {
+			break;
+		}
+		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 			UnifiedVectorFormat fmt;
-			scan_chunk.data[col].ToUnifiedFormat(count, fmt);
-			switch (scan_chunk.data[col].GetType().id()) {
+			chunk.data[col].ToUnifiedFormat(count, fmt);
+			switch (chunk.data[col].GetType().id()) {
 			case LogicalTypeId::DOUBLE:
 				AppendMlxColumn<double>(fmt, count, values[col], valid[col]);
 				break;
@@ -317,24 +343,15 @@ static void WarmColumnCacheIfNeeded(ClientContext &context, const string &table_
 				AppendMlxColumn<int32_t>(fmt, count, values[col], valid[col]);
 				break;
 			default:
-				return;
+				return; // unsupported column type: leave the cache unwarmed
 			}
 		}
-		vector<MlxColumnData> cols;
-		for (idx_t col = 0; col < values.size(); col++) {
-			cols.push_back({values[col].data(), valid[col].empty() ? nullptr : valid[col].data()});
+		buffered += count;
+		if (buffered >= kWarmSegmentRows) {
+			flush();
 		}
-		duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, count);
-	};
-
-	while (true) {
-		chunk.Reset();
-		data_table.Scan(transaction, chunk, scan_state);
-		if (chunk.size() == 0) {
-			break;
-		}
-		append_chunk(chunk);
 	}
+	flush();
 	duckdb_mlx::LogDebug("MLX_SUM warmed the GPU cache (unfiltered) for " + table_prefix);
 }
 

@@ -318,70 +318,6 @@ std::optional<mx::array> CombineMasks(const std::optional<mx::array> &a, const s
 }
 
 //! Gather `data` rows where `mask` is true (host index build; compact then compute).
-mx::array CompactMasked(const mx::array &data, const mx::array &mask) {
-	mx::eval({data, mask});
-	auto n = data.shape(0);
-	if (n == 0) {
-		return mx::zeros({0}, mx::float32);
-	}
-	auto mask_u8 = mx::astype(mask, mx::uint8);
-	mx::eval(mask_u8);
-	auto mptr = mask_u8.data<uint8_t>();
-	std::vector<int32_t> idx;
-	idx.reserve(n);
-	for (int i = 0; i < n; i++) {
-		if (mptr[i] != 0) {
-			idx.push_back(i);
-		}
-	}
-	if (idx.empty()) {
-		return mx::zeros({0}, mx::float32);
-	}
-	mx::array indices(idx.data(), {static_cast<int>(idx.size())}, mx::int32);
-	return mx::take(data, indices, 0);
-}
-
-bool MaskMostlyFalse(const mx::array &mask) {
-	auto n = mask.shape(0);
-	if (n == 0) {
-		return false;
-	}
-	auto passed = mx::sum(mx::astype(mask, mx::int32)).item<int32_t>();
-	return passed < n / 2;
-}
-
-mx::array ReduceMasked(const mx::array &expr, const mx::array &mask, MlxAggKind kind) {
-	if (!MaskMostlyFalse(mask)) {
-		switch (kind) {
-		case MlxAggKind::MIN:
-			return mx::min(mx::where(mask, expr, mx::array(std::numeric_limits<float>::infinity())));
-		case MlxAggKind::MAX:
-			return mx::max(mx::where(mask, expr, mx::array(-std::numeric_limits<float>::infinity())));
-		default:
-			return mx::sum(mx::where(mask, expr, mx::array(0.0f)));
-		}
-	}
-	auto compact = CompactMasked(expr, mask);
-	if (compact.ndim() == 0 || compact.shape(0) == 0) {
-		switch (kind) {
-		case MlxAggKind::MIN:
-			return mx::array(std::numeric_limits<float>::infinity());
-		case MlxAggKind::MAX:
-			return mx::array(-std::numeric_limits<float>::infinity());
-		default:
-			return mx::array(0.0f);
-		}
-	}
-	switch (kind) {
-	case MlxAggKind::MIN:
-		return mx::min(compact);
-	case MlxAggKind::MAX:
-		return mx::max(compact);
-	default:
-		return mx::sum(compact);
-	}
-}
-
 //! Appends the lazy graphs of every aggregate over one segment: a value graph
 //! (kind-dependent) and, when a row mask exists, a valid-count graph. Layout
 //! per program: [value?][count?]. Constant-valued outputs must never enter a
@@ -416,57 +352,11 @@ void BuildSumGraphs(const MlxSegment &segment, const std::vector<MlxSumProgram> 
 			}
 		}
 		if (mask.has_value()) {
-			outs.push_back(mx::sum(mx::astype(*mask, mx::int64)));
+			// int32 reduce: segments are well under 2^31 rows and Metal has
+			// no native 64-bit arithmetic
+			outs.push_back(mx::sum(mx::astype(*mask, mx::int32)));
 		}
 	}
-}
-
-//! Late masking: compact sparse predicates before expr eval (outside mx::compile).
-void BuildSumGraphsCompact(const MlxSegment &segment, const std::vector<MlxSumProgram> &programs,
-                           const MlxFilter &filter, std::vector<mx::array> &outs) {
-	std::optional<mx::array> filter_mask;
-	if (!filter.ops.empty()) {
-		filter_mask = EvalOps(segment, filter.ops);
-	}
-	filter_mask = CombineMasks(filter_mask, NullMask(segment, filter.null_cols));
-
-	for (auto &program : programs) {
-		auto mask = CombineMasks(filter_mask, NullMask(segment, program.null_cols));
-		if (HasValueGraph(program.kind)) {
-			auto expr = EvalOps(segment, program.ops);
-			if (mask.has_value()) {
-				outs.push_back(ReduceMasked(expr, *mask, program.kind));
-			} else {
-				switch (program.kind) {
-				case MlxAggKind::MIN:
-					outs.push_back(mx::min(expr));
-					break;
-				case MlxAggKind::MAX:
-					outs.push_back(mx::max(expr));
-					break;
-				default:
-					outs.push_back(mx::sum(expr));
-					break;
-				}
-			}
-		}
-		if (mask.has_value()) {
-			outs.push_back(mx::sum(mx::astype(*mask, mx::int64)));
-		}
-	}
-}
-
-bool SegmentUseCompactMask(const MlxSegment &segment, const MlxFilter &filter) {
-	if (filter.ops.empty()) {
-		return false;
-	}
-	std::optional<mx::array> filter_mask = EvalOps(segment, filter.ops);
-	filter_mask = CombineMasks(filter_mask, NullMask(segment, filter.null_cols));
-	if (!filter_mask.has_value()) {
-		return false;
-	}
-	mx::eval(*filter_mask);
-	return MaskMostlyFalse(*filter_mask);
 }
 
 void MergeSegmentOutputs(const MlxSegment &segment, const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
@@ -478,7 +368,8 @@ void MergeSegmentOutputs(const MlxSegment &segment, const std::vector<MlxSumProg
 		if (HasValueGraph(program.kind)) {
 			value = static_cast<double>(outs[cursor++].item<float>());
 		}
-		int64_t count = SegmentHasMask(segment, filter, program) ? outs[cursor++].item<int64_t>() : segment.count;
+		int64_t count = SegmentHasMask(segment, filter, program) ? static_cast<int64_t>(outs[cursor++].item<int32_t>())
+		                                                         : segment.count;
 		switch (program.kind) {
 		case MlxAggKind::MIN:
 			results[p].value = std::min(results[p].value, value);
@@ -622,16 +513,11 @@ std::vector<MlxSumResult> EvalSegments(const std::vector<MlxSegment> &segments,
 			seg_idx++;
 			continue;
 		}
-		if (SegmentUseCompactMask(segment, filter)) {
-			std::vector<mx::array> outs;
-			BuildSumGraphsCompact(segment, programs, filter, outs);
-			mx::eval(outs);
-			MergeSegmentOutputs(segment, programs, filter, outs, results);
-			seg_idx++;
-			continue;
-		}
-		// mx::compile fuses each segment's whole expression forest into a few
-		// kernels instead of materializing every intermediate array
+		// mx::compile fuses each segment's whole expression forest — masks
+		// included — into a few kernels instead of materializing every
+		// intermediate array. (A gather-then-compute path for highly selective
+		// filters must be gated by zone-map selectivity, never by eagerly
+		// evaluating the mask: that costs more than it saves.)
 		std::vector<mx::array> inputs = segment.cols;
 		std::vector<int32_t> valid_slots(segment.valids.size(), -1);
 		for (size_t i = 0; i < segment.valids.size(); i++) {
