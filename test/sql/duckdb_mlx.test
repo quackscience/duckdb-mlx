@@ -1,0 +1,43 @@
+# name: test/sql/duckdb_mlx.test
+# description: test duckdb_mlx extension loading, settings and info function
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT mlx_info();
+----
+Catalog Error: Scalar Function with name mlx_info does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require duckdb_mlx
+
+# Confirm the extension loaded and reports its status
+query I
+SELECT mlx_info() LIKE 'duckdb_mlx gpu=% spdlog=%';
+----
+true
+
+# Settings registered by the extension
+statement ok
+SET mlx_execution = false;
+
+query I
+SELECT current_setting('mlx_execution');
+----
+false
+
+statement ok
+SET mlx_min_rows = 1000000;
+
+query I
+SELECT current_setting('mlx_min_rows');
+----
+1000000
+
+statement ok
+SET mlx_log_level = 'debug';
+
+statement error
+SET mlx_log_level = 'bogus';
+----
+Invalid Input Error: mlx_log_level must be one of trace|debug|info|warn|error|critical|off
