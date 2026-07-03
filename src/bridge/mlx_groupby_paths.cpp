@@ -1,4 +1,4 @@
-// GROUP BY path selection — SQL setting + env override (gpudb GPUDB_METAL_GROUPBY_PATH).
+// GROUP BY path selection — SQL setting + env override (MLX_GROUPBY_PATH).
 
 #include "mlx_groupby_detail.hpp"
 
@@ -37,10 +37,9 @@ const char *GroupbyPathFromEnv() {
 	return std::getenv("MLX_GROUPBY_PATH");
 }
 
-bool GroupbyShouldTrySlotlock(int n, int64_t estimated_groups) {
+bool GroupbyShouldTrySlotlock(int /*n*/, int64_t estimated_groups) {
 	constexpr int64_t kMinGroups = 1024;
 	constexpr int64_t kSafeCap = 16'000'000;
-	constexpr int kMinRows = 100'000;
 
 	const char *path = GroupbyPathFromEnv();
 	if (path) {
@@ -51,17 +50,14 @@ bool GroupbyShouldTrySlotlock(int n, int64_t estimated_groups) {
 			return false;
 		}
 	}
-	if (n < kMinRows) {
-		return false;
-	}
 	if (estimated_groups > 0) {
 		return estimated_groups >= kMinGroups && estimated_groups <= kSafeCap;
 	}
-	return true;
+	return false;
 }
 
 bool GroupbyShouldTryRadix(int n, int64_t estimated_groups) {
-	constexpr int64_t kLowCard = 1024;
+	constexpr int64_t kMinGroups = 1024;
 	constexpr int64_t kSlotCap = 16'000'000;
 	constexpr int kMinRows = 50'000;
 
@@ -80,14 +76,10 @@ bool GroupbyShouldTryRadix(int n, int64_t estimated_groups) {
 	if (estimated_groups > kSlotCap) {
 		return true;
 	}
-	if (estimated_groups > 0 && estimated_groups < kLowCard) {
+	if (estimated_groups >= kMinGroups && estimated_groups <= kSlotCap) {
 		return false;
 	}
-	// gpudb: radix when slot-lock is not the sweet spot (very high card or slot-lock declined).
-	if (estimated_groups > 0 && estimated_groups >= kLowCard && estimated_groups <= kSlotCap) {
-		return false;
-	}
-	return n >= kMinRows;
+	return true;
 }
 
 } // namespace duckdb_mlx

@@ -206,8 +206,7 @@ std::vector<MlxGroupbyRow> GroupbySumSlotlockGpu(mx::array keys, mx::array vals)
 	auto partition_write_pos = mx::zeros({parts}, mx::uint32);
 	auto scatter_keys = mx::zeros({n}, mx::int64);
 	auto scatter_values = mx::zeros({n}, mx::int64);
-	std::vector<uint32_t> out_count_host = {0};
-	auto out_count = mx::array(out_count_host.begin(), {1}, mx::uint32);
+	auto out_count = mx::zeros({1}, mx::uint32);
 	auto out_keys = mx::zeros({n}, mx::int64);
 	auto out_sums = mx::zeros({n}, mx::int64);
 
@@ -223,8 +222,8 @@ std::vector<MlxGroupbyRow> GroupbySumSlotlockGpu(mx::array keys, mx::array vals)
 		return {};
 	}
 	partition_offsets = mx::array(offsets_host.data(), {parts + 1}, mx::uint32);
-
 	partition_write_pos = mx::zeros({parts}, mx::uint32);
+
 	PartitionScatterKernel()({keys, vals_i64, partition_offsets, partition_write_pos}, {mx::Shape {n}, mx::Shape {n}},
 	                         {mx::int64, mx::int64}, std::make_tuple(count_blocks, 1, 1),
 	                         std::make_tuple(kCountThreads, 1, 1), {}, 0.0f, false, mx::Device::gpu);

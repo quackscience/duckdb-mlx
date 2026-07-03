@@ -2490,6 +2490,51 @@ static void PopulateStateFromHashRows(MlxGroupedState &state, const std::vector<
 	}
 }
 
+static void PopulateStateFromDenseGroupby(MlxGroupedState &state, int64_t key_offset,
+                                          const std::vector<MlxGroupbyRow> &rows,
+                                          const std::vector<MlxSumProgram> &programs) {
+	auto nprogs = programs.size();
+	for (auto &row : rows) {
+		auto g = row.key - key_offset;
+		if (g < 0 || g >= state.card) {
+			continue;
+		}
+		auto gs = static_cast<size_t>(g);
+		state.rows[gs] = row.count > 0 ? row.count : 1;
+		for (size_t p = 0; p < nprogs; p++) {
+			auto slot = gs * nprogs + p;
+			if (programs[p].kind == MlxAggKind::SUM || programs[p].kind == MlxAggKind::AVG) {
+				if (programs[p].int_lane) {
+					state.ivalues[slot] = static_cast<__int128>(static_cast<int64_t>(row.sum));
+				} else {
+					state.fvalues[slot] = row.sum;
+				}
+				state.counts[slot] = state.rows[gs];
+			}
+		}
+	}
+}
+
+static bool TryGroupedDenseCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                  const std::string &group_col_key, const std::string &value_col_key,
+                                  const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	if (spec.hash_groupby || !filter.ops.empty() || spec.key_cols.size() != 1 || programs.size() != 1 ||
+	    programs[0].kind != MlxAggKind::SUM) {
+		return false;
+	}
+	int64_t population = MlxCachePopulation(group_col_key);
+	if (population < 0 || !MlxGroupbyDenseReady(group_col_key, value_col_key, population)) {
+		return false;
+	}
+	std::vector<MlxGroupbyRow> rows;
+	if (!MlxGroupbyDenseTryRead(group_col_key, value_col_key, population, rows)) {
+		return false;
+	}
+	auto key_offset = spec.key_offsets.empty() ? 0 : spec.key_offsets[0];
+	PopulateStateFromDenseGroupby(state, key_offset, rows, programs);
+	return true;
+}
+
 void MlxGroupedHashGroupByComplete(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs,
                                    int64_t estimated_groups) {
 	if (state.hash_key_buf.empty()) {
@@ -2651,6 +2696,15 @@ void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &sp
 	}
 	if (state.dense_reduce && !prefix.empty() && TryLineitemQ1FastPath(state, prefix, col_keys, programs, filter)) {
 		return;
+	}
+	if (spec.key_cols.size() == 1 && programs.size() == 1 && !spec.hash_groupby) {
+		auto gkey = col_keys[static_cast<size_t>(spec.key_cols[0])];
+		auto vcol = programs[0].ops[0].col;
+		if (vcol >= 0 && static_cast<size_t>(vcol) < col_keys.size()) {
+			if (TryGroupedDenseCached(state, spec, gkey, col_keys[static_cast<size_t>(vcol)], programs, filter)) {
+				return;
+			}
+		}
 	}
 	if (state.dense_reduce) {
 		MlxSegment mega;

@@ -784,6 +784,9 @@ public:
 	bool ready = false;
 };
 
+static bool IsPlainColumnProgram(const duckdb_mlx::MlxSumProgram &program);
+static bool IsPlainSumGroupByPrograms(const vector<duckdb_mlx::MlxSumProgram> &programs);
+
 class MlxGroupedPhysicalOperator : public PhysicalOperator {
 public:
 	MlxGroupedPhysicalOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
@@ -947,6 +950,15 @@ public:
 				size_t row_count = SegmentRowCount(segment);
 				SegmentColumns(segment, cols);
 				duckdb_mlx::MlxCacheStoreSegment(plan.population, col_keys, plan.store_col, cols, row_count);
+				if (keys.size() == 1 && !keys[0].is_varchar && IsPlainSumGroupByPrograms(programs)) {
+					auto gcol = static_cast<size_t>(keys[0].scan_col);
+					auto vcol = static_cast<size_t>(programs[0].ops[0].col);
+					if (gcol < cols.size() && vcol < cols.size()) {
+						duckdb_mlx::MlxGroupbyDenseAccumulateColumns(
+						    keys[0].cache_key, col_keys[static_cast<size_t>(programs[0].ops[0].col)], plan.population,
+						    cols[gcol], cols[vcol], row_count);
+					}
+				}
 			}
 			duckdb_mlx::MlxCacheFuseTable(table_prefix);
 			for (size_t k = 0; k < keys.size(); k++) {
@@ -1218,6 +1230,10 @@ static bool ProgramsAreCpuFast(const vector<duckdb_mlx::MlxSumProgram> &programs
 	return IsPlainColumnProgram(programs[0]);
 }
 
+static bool IsPlainSumGroupByPrograms(const vector<duckdb_mlx::MlxSumProgram> &programs) {
+	return programs.size() == 1 && programs[0].kind == duckdb_mlx::MlxAggKind::SUM && IsPlainColumnProgram(programs[0]);
+}
+
 //! gpudb hybrid_planner + PLAN §1.1 — cold GROUP BY where DuckDB CPU already wins.
 static bool GroupbyInterceptDeclineCold(idx_t estimated_rows, int64_t combined_card, bool cached, bool hash_groupby) {
 	if (cached) {
@@ -1229,7 +1245,7 @@ static bool GroupbyInterceptDeclineCold(idx_t estimated_rows, int64_t combined_c
 	if (estimated_rows < kGroupBySmallN) {
 		return true;
 	}
-	if (!hash_groupby && combined_card > 0 && combined_card < kLowCardGroups && estimated_rows <= kGroupByMidN) {
+	if (!hash_groupby && combined_card > 0 && combined_card <= kLowCardGroups && estimated_rows <= kGroupByMidN) {
 		return true;
 	}
 	return false;

@@ -252,6 +252,9 @@ std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *valu
 void MlxGroupbyDenseAccumulateHost(const std::string &group_col_key, const std::string &value_col_key,
                                    int64_t population, const float *group_values, const float *sum_values,
                                    size_t count);
+void MlxGroupbyDenseAccumulateColumns(const std::string &group_col_key, const std::string &value_col_key,
+                                      int64_t population, const MlxColumnData &group_col,
+                                      const MlxColumnData &value_col, size_t count);
 
 //! Whether a cached GROUP BY over these columns is provably correct (dense
 //! table ready, or fp32-exact integer keys and no NULLs per zone maps).

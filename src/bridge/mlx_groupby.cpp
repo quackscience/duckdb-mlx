@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -309,6 +310,21 @@ std::vector<MlxGroupbyRow> MlxGroupbySumArrays(mx::array key_arr, mx::array val_
 	return PickGpuPath(key_arr, val_arr, use_hash, estimated_groups);
 }
 
+static int64_t EstimateGroupsFromKeys(const mx::array &key_arr) {
+	if (key_arr.shape(0) == 0) {
+		return -1;
+	}
+	mx::eval(key_arr);
+	auto kmin = mx::min(key_arr).item<int64_t>();
+	auto kmax = mx::max(key_arr).item<int64_t>();
+	if (kmax < kmin || kmin == INT64_MIN) {
+		return -1;
+	}
+	auto span = static_cast<int64_t>(kmax - kmin + 1);
+	auto nrows = key_arr.shape(0);
+	return span <= nrows ? span : static_cast<int64_t>(nrows);
+}
+
 std::vector<MlxGroupbyRow> MlxGroupbySumDenseGpuArrays(mx::array key_arr, mx::array val_arr) {
 	return GroupbySumDenseGpu(key_arr, val_arr);
 }
@@ -379,6 +395,73 @@ void DenseGroupbyResize(DenseGroupbyAcc &acc, int64_t kmin, int64_t kmax) {
 }
 
 } // namespace
+
+namespace {
+
+mx::array ColumnAsFloat32(const MlxColumnData &col, size_t count) {
+	std::vector<float> buf(count);
+	if (col.ivalues) {
+		for (size_t i = 0; i < count; i++) {
+			buf[i] = static_cast<float>(col.ivalues[i]);
+		}
+	} else if (col.values) {
+		for (size_t i = 0; i < count; i++) {
+			buf[i] = col.values[i];
+		}
+	} else {
+		return mx::zeros({static_cast<int>(count)}, mx::float32);
+	}
+	return mx::array(buf.data(), {static_cast<int>(count)}, mx::float32);
+}
+
+mx::array ColumnAsInt64Keys(const MlxColumnData &col, size_t count) {
+	std::vector<int64_t> buf(count);
+	if (col.ivalues) {
+		for (size_t i = 0; i < count; i++) {
+			if (col.valid && col.valid[i] == 0) {
+				buf[i] = INT64_MIN;
+			} else {
+				buf[i] = col.ivalues[i];
+			}
+		}
+	} else if (col.values) {
+		for (size_t i = 0; i < count; i++) {
+			if (col.valid && col.valid[i] == 0) {
+				buf[i] = INT64_MIN;
+			} else {
+				buf[i] = static_cast<int64_t>(col.values[i]);
+			}
+		}
+	} else {
+		return mx::zeros({static_cast<int>(count)}, mx::int64);
+	}
+	return mx::array(buf.data(), {static_cast<int>(count)}, mx::int64);
+}
+
+} // namespace
+
+void MlxGroupbyDenseAccumulateColumns(const std::string &group_col_key, const std::string &value_col_key,
+                                      int64_t population, const MlxColumnData &group_col,
+                                      const MlxColumnData &value_col, size_t count) {
+	if (count == 0) {
+		return;
+	}
+	auto keys = ColumnAsInt64Keys(group_col, count);
+	auto vals = ColumnAsFloat32(value_col, count);
+	if (group_col.valid || value_col.valid) {
+		std::vector<uint8_t> mask(count, 1);
+		for (size_t i = 0; i < count; i++) {
+			if ((group_col.valid && group_col.valid[i] == 0) || (value_col.valid && value_col.valid[i] == 0)) {
+				mask[i] = 0;
+			}
+		}
+		auto mask_arr = mx::array(mask.data(), {static_cast<int>(count)}, mx::uint8);
+		auto m = mx::astype(mask_arr, mx::bool_);
+		keys = mx::where(m, keys, mx::array(INT64_MIN, mx::int64));
+		vals = mx::where(m, vals, mx::array(0.0f, mx::float32));
+	}
+	MlxGroupbyDenseAccumulate(group_col_key, value_col_key, population, keys, vals);
+}
 
 void MlxGroupbyDenseAccumulate(const std::string &group_col_key, const std::string &value_col_key, int64_t population,
                                mx::array key_arr, mx::array val_arr) {
@@ -463,7 +546,7 @@ std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *valu
 		key_arr = mx::where(m, key_arr, mx::array(INT64_MIN));
 		val_arr = mx::where(m, val_arr, mx::array(0.0f));
 	}
-	return PickGpuPath(key_arr, val_arr, use_hash, -1);
+	return PickGpuPath(key_arr, val_arr, use_hash, EstimateGroupsFromKeys(key_arr));
 }
 
 double MlxGroupbyBenchSum(const int64_t *keys, const double *values, size_t count, bool use_hash) {
