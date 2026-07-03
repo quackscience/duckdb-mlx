@@ -217,7 +217,7 @@ void MlxCacheMaterializeLineitemQ1(const std::string &table_prefix, int col_ship
                                    int col_linestatus, int col_quantity, int col_extendedprice, int col_discount);
 //! Rewrite program value graphs to resident derived columns when fingerprints match.
 size_t MlxCacheBindDerivedPrograms(const std::string &table_prefix, std::vector<std::string> &col_keys,
-                                 std::vector<MlxSumProgram> &programs);
+                                   std::vector<MlxSumProgram> &programs);
 
 //! Evaluates aggregate programs over cached columns, entirely GPU-resident.
 //! Partition-level zone maps prune segments before kernel launch when the WHERE
@@ -292,9 +292,8 @@ void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, co
 //! Accumulates every cached segment of `col_keys` (order matches `cols`
 //! positions used by the programs and spec).
 void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &spec,
-                                const std::vector<std::string> &col_keys,
-                                const std::vector<MlxSumProgram> &programs, const MlxFilter &filter,
-                                const std::string &table_prefix = "");
+                                const std::vector<std::string> &col_keys, const std::vector<MlxSumProgram> &programs,
+                                const MlxFilter &filter, const std::string &table_prefix = "");
 
 //! Download GPU scatter accumulators into `state` and release GPU resources.
 void MlxGroupedGpuFinish(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs);

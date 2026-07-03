@@ -27,9 +27,8 @@ static void MlxInfoFun(DataChunk &args, ExpressionState &state, Vector &result) 
 #else
 	std::string mlx_version = "none";
 #endif
-	auto info =
-	    StringUtil::Format("mlx gpu=%s mlx=%s spdlog=%s", MLX_GPU_AVAILABLE ? "available" : "unavailable",
-	                       mlx_version, duckdb_mlx::SpdlogVersion());
+	auto info = StringUtil::Format("mlx gpu=%s mlx=%s spdlog=%s", MLX_GPU_AVAILABLE ? "available" : "unavailable",
+	                               mlx_version, duckdb_mlx::SpdlogVersion());
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	auto result_data = ConstantVector::GetData<string_t>(result);
 	result_data[0] = StringVector::AddString(result, info);
@@ -311,28 +310,27 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(ScalarFunction("mlx_info", {}, LogicalType::VARCHAR, MlxInfoFun));
 	loader.RegisterFunction(ScalarFunction("mlx_selftest", {}, LogicalType::VARCHAR, MlxSelftestFun));
-	loader.RegisterFunction(ScalarFunction("mlx_stream_sum_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                                       MlxStreamSumBenchFun));
-	loader.RegisterFunction(ScalarFunction("mlx_multi_agg_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                                       MlxMultiAggBenchFun));
+	loader.RegisterFunction(
+	    ScalarFunction("mlx_stream_sum_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR, MlxStreamSumBenchFun));
+	loader.RegisterFunction(
+	    ScalarFunction("mlx_multi_agg_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR, MlxMultiAggBenchFun));
 	loader.RegisterFunction(
 	    ScalarFunction("mlx_sum", {LogicalType::LIST(LogicalType::BIGINT)}, LogicalType::BIGINT, MlxSumFun));
 	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
 	                                       LogicalType::DOUBLE, MlxExprBenchFun));
-	loader.RegisterFunction(ScalarFunction("mlx_cache_stats", {}, LogicalType::LIST(LogicalType::BIGINT),
-	                                       MlxCacheStatsFun));
+	loader.RegisterFunction(
+	    ScalarFunction("mlx_cache_stats", {}, LogicalType::LIST(LogicalType::BIGINT), MlxCacheStatsFun));
 	loader.RegisterFunction(ScalarFunction("mlx_cache_clear", {}, LogicalType::VARCHAR, MlxCacheClearFun));
 	loader.RegisterFunction(ScalarFunction("mlx_cache_pin", {LogicalType::VARCHAR},
 	                                       LogicalType::LIST(LogicalType::BIGINT), MlxCachePinFun));
 	loader.RegisterFunction(ScalarFunction("mlx_cache_pin_tpch", {}, LogicalType::VARCHAR, MlxCachePinTpchFun));
-	loader.RegisterFunction(ScalarFunction("mlx_groupby_bench",
-	                                       {LogicalType::LIST(LogicalType::BIGINT),
-	                                        LogicalType::LIST(LogicalType::BIGINT)},
-	                                       LogicalType::DOUBLE, MlxGroupbyBenchFun));
-	loader.RegisterFunction(ScalarFunction("mlx_groupby_bench",
-	                                       {LogicalType::LIST(LogicalType::BIGINT),
-	                                        LogicalType::LIST(LogicalType::BIGINT), LogicalType::BOOLEAN},
-	                                       LogicalType::DOUBLE, MlxGroupbyBenchFun));
+	loader.RegisterFunction(ScalarFunction(
+	    "mlx_groupby_bench", {LogicalType::LIST(LogicalType::BIGINT), LogicalType::LIST(LogicalType::BIGINT)},
+	    LogicalType::DOUBLE, MlxGroupbyBenchFun));
+	loader.RegisterFunction(ScalarFunction(
+	    "mlx_groupby_bench",
+	    {LogicalType::LIST(LogicalType::BIGINT), LogicalType::LIST(LogicalType::BIGINT), LogicalType::BOOLEAN},
+	    LogicalType::DOUBLE, MlxGroupbyBenchFun));
 	RegisterMlxVss(loader);
 #ifdef DUCKDB_MLX_GPU_ENABLED
 	RegisterMlxOptimizer(loader.GetDatabaseInstance());

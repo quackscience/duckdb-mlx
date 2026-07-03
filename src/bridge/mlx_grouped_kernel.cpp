@@ -174,9 +174,8 @@ const mx::fast::CustomKernelFunction &GroupedTileAccumulateKernel() {
             }
         )";
 		return mx::fast::metal_kernel("mlx_grouped_tile_i64",
-		                              {"codes", "pass", "val0", "val1", "val2", "val3", "val4", "val5", "val6",
-		                               "val7", "vmask0", "vmask1", "vmask2", "vmask3", "vmask4", "vmask5", "vmask6",
-		                               "vmask7"},
+		                              {"codes", "pass", "val0", "val1", "val2", "val3", "val4", "val5", "val6", "val7",
+		                               "vmask0", "vmask1", "vmask2", "vmask3", "vmask4", "vmask5", "vmask6", "vmask7"},
 		                              {"partial_rows", "partial_sums", "partial_counts"}, src, TileKernelHeader(), true,
 		                              false);
 	}();
@@ -347,7 +346,8 @@ const mx::fast::CustomKernelFunction &GroupedTileMergeKernel() {
             }
         )";
 		return mx::fast::metal_kernel("mlx_grouped_tile_merge", {"partial_rows", "partial_sums", "partial_counts"},
-		                              {"final_rows", "final_sums", "final_counts"}, src, TileKernelHeader(), true, false);
+		                              {"final_rows", "final_sums", "final_counts"}, src, TileKernelHeader(), true,
+		                              false);
 	}();
 	return kernel;
 }
@@ -419,10 +419,9 @@ void RunTileAccumulateAndMerge(MlxGroupedState &state, int card, int val_n, size
 	auto template_args = TileTemplateArgs(card, val_n);
 
 	auto merged = GroupedTileMergeKernel()(
-	    {partial_rows, partial_sums, partial_counts},
-	    {mx::Shape {card}, mx::Shape {slots}, mx::Shape {slots}}, {mx::int32, mx::int64, mx::int32},
-	    std::make_tuple(merge_grid, 1, 1), std::make_tuple(kThreadsPerGroup, 1, 1), template_args, 0.0f, false,
-	    mx::Device::gpu);
+	    {partial_rows, partial_sums, partial_counts}, {mx::Shape {card}, mx::Shape {slots}, mx::Shape {slots}},
+	    {mx::int32, mx::int64, mx::int32}, std::make_tuple(merge_grid, 1, 1), std::make_tuple(kThreadsPerGroup, 1, 1),
+	    template_args, 0.0f, false, mx::Device::gpu);
 
 	mx::eval({merged[0], merged[1], merged[2]});
 	MergeTilePartials(state, card, val_n, nprogs, val_slots, programs, merged[0], merged[1], merged[2]);
@@ -463,9 +462,10 @@ void GroupedTileKernelAccumulate(MlxGroupedState &state, const mx::array &codes,
 	for (int i = 0; i < kMaxTileValProgs; i++) {
 		if (i < val_n) {
 			val_inputs.push_back(val_exprs[static_cast<size_t>(i)].second);
-			mask_inputs.push_back((i < static_cast<int>(val_masks.size()) && val_masks[static_cast<size_t>(i)].has_value())
-			                          ? *val_masks[static_cast<size_t>(i)]
-			                          : ones);
+			mask_inputs.push_back(
+			    (i < static_cast<int>(val_masks.size()) && val_masks[static_cast<size_t>(i)].has_value())
+			        ? *val_masks[static_cast<size_t>(i)]
+			        : ones);
 		} else {
 			val_inputs.push_back(mx::zeros({n}, mx::int64));
 			mask_inputs.push_back(ones);
@@ -523,10 +523,11 @@ void GroupedPackedTileAccumulate(MlxGroupedState &state, const mx::array &codes,
 	int grid_threads = std::max(tiles, 1) * kThreadsPerGroup;
 	auto template_args = TileTemplateArgs(card, val_n);
 
-	auto built = GroupedPackedTileKernel()(
-	    {codes, pass_u8, packed, col_map_arr}, {mx::Shape {tiles, card}, mx::Shape {tiles, slots}, mx::Shape {tiles, slots}},
-	    {mx::int32, mx::int64, mx::int32}, std::make_tuple(grid_threads, 1, 1), std::make_tuple(kThreadsPerGroup, 1, 1),
-	    template_args, 0.0f, false, mx::Device::gpu);
+	auto built =
+	    GroupedPackedTileKernel()({codes, pass_u8, packed, col_map_arr},
+	                              {mx::Shape {tiles, card}, mx::Shape {tiles, slots}, mx::Shape {tiles, slots}},
+	                              {mx::int32, mx::int64, mx::int32}, std::make_tuple(grid_threads, 1, 1),
+	                              std::make_tuple(kThreadsPerGroup, 1, 1), template_args, 0.0f, false, mx::Device::gpu);
 
 	RunTileAccumulateAndMerge(state, card, val_n, nprogs, n, tiles, built[0], built[1], built[2], val_slots, programs);
 }
@@ -837,13 +838,12 @@ int64_t StreamingInt64Sum(const mx::array &values) {
 	auto n = static_cast<int>(values.shape(0));
 	int grid = PickSumGrid(n);
 	int grid_threads = grid * kThreadsPerGroup;
-	auto pass1 = StreamingInt64SumKernel()({values}, {mx::Shape {grid}}, {mx::int64},
-	                                       std::make_tuple(grid_threads, 1, 1),
-	                                       std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
-	auto pass2 = StreamingInt64SumPartialsKernel()({pass1[0]}, {mx::Shape {1}}, {mx::int64},
-	                                               std::make_tuple(kThreadsPerGroup, 1, 1),
-	                                               std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false,
-	                                               mx::Device::gpu);
+	auto pass1 =
+	    StreamingInt64SumKernel()({values}, {mx::Shape {grid}}, {mx::int64}, std::make_tuple(grid_threads, 1, 1),
+	                              std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
+	auto pass2 = StreamingInt64SumPartialsKernel()(
+	    {pass1[0]}, {mx::Shape {1}}, {mx::int64}, std::make_tuple(kThreadsPerGroup, 1, 1),
+	    std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
 	mx::eval(pass2[0]);
 	return pass2[0].item<int64_t>();
 }
@@ -856,13 +856,12 @@ MlxMultiAggResult StreamingMultiAgg(const mx::array &values) {
 	auto n = static_cast<int>(values.shape(0));
 	int grid = PickSumGrid(n);
 	int grid_threads = grid * kThreadsPerGroup;
-	auto pass1 = StreamingMultiAggKernel()({values}, {mx::Shape {grid, 4}}, {mx::int64},
-	                                       std::make_tuple(grid_threads, 1, 1),
-	                                       std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
-	auto pass2 = StreamingMultiAggPartialsKernel()({pass1[0]}, {mx::Shape {4}}, {mx::int64},
-	                                               std::make_tuple(kThreadsPerGroup, 1, 1),
-	                                               std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false,
-	                                               mx::Device::gpu);
+	auto pass1 =
+	    StreamingMultiAggKernel()({values}, {mx::Shape {grid, 4}}, {mx::int64}, std::make_tuple(grid_threads, 1, 1),
+	                              std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
+	auto pass2 = StreamingMultiAggPartialsKernel()(
+	    {pass1[0]}, {mx::Shape {4}}, {mx::int64}, std::make_tuple(kThreadsPerGroup, 1, 1),
+	    std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
 	mx::eval(pass2[0]);
 	auto data = pass2[0].data<int64_t>();
 	out.sum = data[0];
@@ -873,8 +872,7 @@ MlxMultiAggResult StreamingMultiAgg(const mx::array &values) {
 }
 
 void GroupedQ1FusedAccumulate(MlxGroupedState &state, const mx::array &codes, const mx::array &pass,
-                              const mx::array &packed, int val_n,
-                              const std::vector<std::pair<size_t, int>> &val_slots,
+                              const mx::array &packed, int val_n, const std::vector<std::pair<size_t, int>> &val_slots,
                               const std::vector<MlxSumProgram> &programs) {
 	if (codes.shape(0) == 0 || !ProgramsUseTileKernel(programs, state.card)) {
 		throw std::runtime_error("GroupedQ1FusedAccumulate: ineligible program/card shape");
@@ -904,7 +902,8 @@ void GroupedQ1FusedAccumulate(MlxGroupedState &state, const mx::array &codes, co
 	auto template_args = TileTemplateArgs(card, val_n);
 
 	auto built = GroupedQ1FusedScanKernel()(
-	    {codes, pass_u8, packed, col_map_arr}, {mx::Shape {parts, card}, mx::Shape {parts, slots}, mx::Shape {parts, slots}},
+	    {codes, pass_u8, packed, col_map_arr},
+	    {mx::Shape {parts, card}, mx::Shape {parts, slots}, mx::Shape {parts, slots}},
 	    {mx::int32, mx::int64, mx::int32}, std::make_tuple(grid_threads, 1, 1), std::make_tuple(kThreadsPerGroup, 1, 1),
 	    template_args, 0.0f, false, mx::Device::gpu);
 
