@@ -130,21 +130,37 @@ and MLX/spdlog headers. Data crosses the bridge as raw unified-memory pointers.
 Requires **macOS 14+**, **full Xcode.app** (Apple's IDE — not Command Line Tools alone),
 CMake, and ninja. MLX compiles Metal shaders during the build.
 
-**There is no Homebrew formula for the Metal compiler.** `brew install` packages like
-`cmake` / `ninja` are fine, but Xcode itself must come from the **App Store** or the
-[`xcodes`](https://github.com/XcodesOrg/xcodes) CLI.
+**There is no Homebrew formula for the Metal compiler.** `brew install cmake ninja`
+is fine; **Xcode itself must come from Apple** (App Store or developer download).
 
-Check the toolchain (run this before `make`):
+Check the toolchain before `make`:
 
 ```shell
 ./scripts/check_toolchain.sh
 ```
 
-You need `xcrun -sdk macosx metal --version` to succeed. If it fails and
-`xcode-select -p` shows `/Library/Developer/CommandLineTools`, full Xcode is not
-active yet.
+You need `xcrun -sdk macosx metal --version` to succeed.
 
-**App Store (simplest):** install Xcode, open it once, then:
+### Install Xcode (first time — no Xcode on disk yet)
+
+Use **one** of these. Do **not** use `brew install xcodesorg/made/xcodes` for the
+first install — that Homebrew formula fails without Xcode already present (`xcbuild`
+missing).
+
+1. **App Store** — search “Xcode”, Install, open once to finish setup.
+
+2. **Terminal via `mas`** (optional):
+
+```shell
+brew install mas
+mas install 497799835
+open -a Xcode
+```
+
+3. **[Apple Developer downloads](https://developer.apple.com/download/all/)** — download
+   the `.xip`, extract, drag `Xcode.app` to `/Applications`, open once.
+
+Then activate the toolchain:
 
 ```shell
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -152,20 +168,11 @@ sudo xcodebuild -license accept
 xcrun -sdk macosx metal --version
 ```
 
-**Homebrew + xcodes** (when App Store/Xcode path is not `/Applications/Xcode.app`):
+If Xcode is named `Xcode-16.x.app`, run `./scripts/check_toolchain.sh` for the exact
+`xcode-select` path.
 
-```shell
-brew install xcodesorg/made/xcodes
-xcodes install --latest
-xcodes select --latest
-xcodes run --latest
-sudo xcodebuild -license accept
-xcrun -sdk macosx metal --version
-```
-
-If Xcode lives elsewhere (e.g. `/Applications/Xcode-16.4.0.app`), point
-`xcode-select` at that bundle's `Contents/Developer` (the check script prints the
-exact path).
+The [`xcodes`](https://github.com/XcodesOrg/xcodes) CLI is only useful **after** you
+already have one Xcode — for installing/switching versions side by side.
 
 Portable C++ dependencies (currently **spdlog**) are declared in `vcpkg.json` and
 installed automatically on first build — `make` bootstraps a local `vcpkg/` checkout

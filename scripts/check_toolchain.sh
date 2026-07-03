@@ -48,13 +48,10 @@ fi
 
 echo "FAIL: Metal compiler not available (required to build vendored MLX)."
 echo ""
-echo "Homebrew does not ship Apple's Metal compiler. You need the full Xcode.app"
-echo "from Apple (App Store or the xcodes CLI), not only:"
-echo "  xcode-select --install"
-echo "  brew install ...   # no brew formula provides xcrun metal"
+echo "Homebrew does not ship Apple's Metal compiler. Command Line Tools are not enough."
 echo ""
 if [ ${#found[@]} -gt 0 ]; then
-	echo "Xcode is installed but not selected. Run ONE of these (copy the full path):"
+	echo "Xcode is on disk but not selected. Run ONE of these (copy the full path):"
 	for app in "${found[@]}"; do
 		dev="$app/Contents/Developer"
 		if [ -d "$dev" ]; then
@@ -62,19 +59,25 @@ if [ ${#found[@]} -gt 0 ]; then
 		fi
 	done
 	echo ""
-	echo "If you installed via xcodes (brew install xcodesorg/made/xcodes):"
-	echo "  xcodes select --latest"
-	echo "  xcodes run --latest    # open Xcode once to finish setup"
+	echo "Open Xcode once from Finder, then:"
 else
-	echo "Install full Xcode (pick one):"
-	echo "  App Store → search \"Xcode\" → Install → open once"
-	echo "  brew install xcodesorg/made/xcodes"
-	echo "  xcodes install --latest"
-	echo "  xcodes select --latest"
-	echo "  xcodes run --latest"
+	echo "Install Xcode.app first (you have none). Pick one:"
+	echo ""
+	echo "  A) Mac App Store — search \"Xcode\", Install, open once"
+	echo "     Or from Terminal (after: brew install mas):"
+	echo "       mas install 497799835"
+	echo ""
+	echo "  B) https://developer.apple.com/download/all/ — download .xip,"
+	echo "     double-click to extract, drag Xcode.app to /Applications, open once"
+	echo ""
+	echo "  Do NOT use 'brew install xcodesorg/made/xcodes' for the first install —"
+	echo "  that formula fails without Xcode already present (needs xcbuild)."
+	echo ""
+	echo "  After Xcode is installed:"
 fi
-echo ""
-echo "Then accept the license and verify:"
+echo "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
 echo "  sudo xcodebuild -license accept"
 echo "  xcrun -sdk macosx metal --version"
+echo ""
+echo "  (If Xcode is named Xcode-16.x.app, run this script again for the exact path.)"
 exit 1
