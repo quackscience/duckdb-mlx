@@ -131,7 +131,7 @@ Requires macOS 14+, Xcode (Metal compiler), CMake, and ninja. Portable C++
 dependencies (currently **spdlog**) are declared in `vcpkg.json` and installed
 automatically on first build — `make` bootstraps a local `vcpkg/` checkout if
 needed. MLX is vendored as a submodule and built into `build/mlx-install` on
-first configure (`scripts/build_mlx.sh`).
+first configure (`scripts/build_mlx.sh`, Metal-only — no JACCL/CPU backend).
 
 ```shell
 git submodule update --init --recursive   # duckdb v1.5.4, extension-ci-tools, mlx
@@ -143,6 +143,14 @@ cache and rebuild:
 
 ```shell
 rm -rf build/release
+GEN=ninja make release
+```
+
+If the vendored MLX build failed (e.g. after an Xcode/SDK upgrade), clear the MLX
+artifacts and retry:
+
+```shell
+rm -rf build/mlx-build build/mlx-install
 GEN=ninja make release
 ```
 
