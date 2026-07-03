@@ -1,0 +1,118 @@
+# name: test/sql/mlx_groupby_paths.test
+# description: small-scale GPU GROUP BY path coverage (dense / slotlock / radix / sort)
+# group: [sql]
+
+require mlx
+
+# ---------------------------------------------------------------------------
+# dense: low cardinality perfect-hash (100 groups, 20k rows)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_dense AS
+SELECT (range % 100)::BIGINT AS g, (range * 2)::DOUBLE AS x
+FROM range(20000);
+
+statement ok
+SET mlx_groupby_path = 'dense';
+
+statement ok
+SET VARIABLE chk_dense = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_dense);
+
+statement ok
+SET VARIABLE ref_dense = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_dense GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('chk_dense') - getvariable('ref_dense')) / abs(getvariable('ref_dense')) < 1e-6;
+----
+true
+
+# ---------------------------------------------------------------------------
+# slotlock: medium cardinality (2k groups, 100k rows) — forced path
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_slot AS
+SELECT (range % 2000)::BIGINT AS g, (range * 5)::DOUBLE AS x
+FROM range(100000);
+
+statement ok
+SET mlx_groupby_path = 'slotlock';
+
+statement ok
+SET VARIABLE chk_slot = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_slot);
+
+statement ok
+SET VARIABLE ref_slot = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_slot GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('chk_slot') - getvariable('ref_slot')) / abs(getvariable('ref_slot')) < 1e-6;
+----
+true
+
+# ---------------------------------------------------------------------------
+# radix: high cardinality (50k unique keys, 80k rows) — forced path
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_radix AS
+SELECT (range * 7919 + 17) % 50000 AS g, (range * 3)::DOUBLE AS x
+FROM range(80000);
+
+statement ok
+SET mlx_groupby_path = 'radix';
+
+statement ok
+SET VARIABLE chk_radix = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_radix);
+
+statement ok
+SET VARIABLE ref_radix = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_radix GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('chk_radix') - getvariable('ref_radix')) / abs(getvariable('ref_radix')) < 1e-6;
+----
+true
+
+# ---------------------------------------------------------------------------
+# sort: MLX argsort fallback — forced path
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_sort AS
+SELECT (range * 3571 + 3) % 12000 AS g, (range * 11)::DOUBLE AS x
+FROM range(60000);
+
+statement ok
+SET mlx_groupby_path = 'sort';
+
+statement ok
+SET VARIABLE chk_sort = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_sort);
+
+statement ok
+SET VARIABLE ref_sort = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_sort GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('chk_sort') - getvariable('ref_sort')) / abs(getvariable('ref_sort')) < 1e-6;
+----
+true
+
+# ---------------------------------------------------------------------------
+# auto: hybrid dispatch on medium table (no forced path)
+# ---------------------------------------------------------------------------
+statement ok
+SET mlx_groupby_path = 'auto';
+
+statement ok
+CREATE TABLE gb_auto AS
+SELECT (range % 3000)::BIGINT AS g, (range * 9)::DOUBLE AS x
+FROM range(150000);
+
+statement ok
+SET VARIABLE chk_auto = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_auto);
+
+statement ok
+SET VARIABLE ref_auto = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_auto GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('chk_auto') - getvariable('ref_auto')) / abs(getvariable('ref_auto')) < 1e-6;
+----
+true
+
+statement ok
+SET mlx_groupby_path = 'auto';

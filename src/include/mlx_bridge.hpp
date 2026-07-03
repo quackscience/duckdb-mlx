@@ -264,7 +264,10 @@ bool MlxGroupbyCachedSafe(const std::string &group_col_key, const std::string &v
 struct MlxGroupedSpec {
 	std::vector<int32_t> key_cols;    // positions of key columns in `cols`
 	std::vector<int64_t> key_offsets; // subtracted per key before combining
-	std::vector<int64_t> key_cards;   // cardinality per key (product <= 65536)
+	std::vector<int64_t> key_cards;   // cardinality per key (product <= 65536 unless hash_groupby)
+	//! gpudb slot-lock/radix path for wide-span keys (distinct from stats, not min-max span).
+	bool hash_groupby = false;
+	int64_t hash_estimated_groups = -1;
 };
 
 //! Accumulation state: dense tables indexed [group * nprograms + program].
@@ -281,6 +284,12 @@ struct MlxGroupedState {
 	bool dense_reduce = false;
 	//! >=0 while a GPU scatter accumulator is open for this state
 	int64_t gpu_handle = -1;
+	//! gpudb hash aggregate: raw int64 keys emitted from `hash_key_emit[g]`.
+	bool hash_groupby = false;
+	std::vector<int64_t> hash_key_emit;
+	//! Row buffers before slot-lock / radix finalize.
+	std::vector<int64_t> hash_key_buf;
+	std::vector<float> hash_val_buf;
 };
 
 MlxGroupedState MlxGroupedInit(const MlxGroupedSpec &spec, const std::vector<MlxSumProgram> &programs);
@@ -297,6 +306,24 @@ void MlxGroupedAccumulateCached(MlxGroupedState &state, const MlxGroupedSpec &sp
 
 //! Download GPU scatter accumulators into `state` and release GPU resources.
 void MlxGroupedGpuFinish(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs);
+
+//! Finalize hash GROUP BY (slot-lock / radix) into `state` from accumulated segments.
+void MlxGroupedHashGroupByFinish(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                 const std::vector<MlxColumnData> &segment_cols, size_t row_count,
+                                 const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+
+//! Append one segment then run hash aggregate when `state.hash_key_buf` is complete.
+void MlxGroupedHashGroupByAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                     const std::vector<MlxColumnData> &segment_cols, size_t row_count,
+                                     const std::vector<MlxSumProgram> &programs, const MlxFilter &filter);
+
+void MlxGroupedHashGroupByComplete(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs,
+                                   int64_t estimated_groups);
+
+//! Cached hash GROUP BY over GPU-resident columns (wide-span keys).
+void MlxGroupedHashGroupByCached(MlxGroupedState &state, const std::string &group_col_key,
+                                 const std::string &value_col_key, const std::vector<MlxSumProgram> &programs,
+                                 const MlxFilter &filter, int64_t estimated_groups);
 
 // Dictionary encoding for VARCHAR group-key columns cached as fp32 codes.
 

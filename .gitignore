@@ -9,5 +9,8 @@ test/python/__pycache__/
 .Rhistory
 
 # Generated / local only — never commit
+docs/GPUDB_PORT.md
 benchmark/tpch/results/*.duckdb
 *.duckdb
+vcpkg/
+vcpkg_installed/

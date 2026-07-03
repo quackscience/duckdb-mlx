@@ -7,30 +7,41 @@ architecture and roadmap. Progress is test-gated: every capability lands with a 
 differential test against DuckDB's CPU engine before it is committed.
 
 **Status (2026-07-03):** Transparent GPU acceleration is live. Optimizer intercepts supported
-plans; GPU-resident column cache serves repeated queries without rescanning. TPC-H Q1 uses a
-**pin-time bundle + fused Metal grid-stride kernel** (fast path; see benchmarks below). Roofline
-microbenches (`mlx_stream_sum_bench`, `mlx_multi_agg_bench`) reach **~50 GiB/s SF1 / ~400+ GiB/s
-SF10** on pinned lineitem — grouped Q1 still **~15–20 ms SF1** (~1.2× CPU); dedicated low-card
-kernel is next (see PLAN §2a).
+plans with **shape-aware decline** (CPU keeps scan-bound and cold low-card GROUP BY). GPU-resident
+column cache serves repeated queries without rescanning. **Slot-lock + LSD radix GROUP BY**
+on Metal (32K partitions, hybrid dispatch) with `SET mlx_groupby_path = 'dense'|'slotlock'|'radix'|'sort'|'auto'`.
+TPC-H Q1 uses a **pin-time bundle + dedicated/fused Metal kernels** (see `tpch_q1_pinned.test`).
 
 ## Quick benchmark (repeatable)
 
 ```shell
 GEN=ninja make release
-./build/release/test/unittest "[sql]"          # 211 assertions, 12 SQL files
+./build/release/test/unittest "[sql]"          # differential SQL suite (see test/sql/)
 
 benchmark/run_all.sh 1                         # minimal + roofline + Q1 @ SF1
 benchmark/bench_roofline.sh 1                  # stream SUM + multi-agg GiB/s
 benchmark/bench_q1.sh 1                        # official TPC-H Q1 CPU vs GPU (pinned)
+benchmark/bench_groupby_paths.sh               # GROUP BY path microbench (small scale)
 python3 benchmark/tpch/run.py 1                # full 22-query GQE harness
 ```
+
+**GROUP BY path testing (local → M3 Ultra):**
+
+```sql
+SET mlx_groupby_path = 'slotlock';  -- or dense | radix | sort | auto
+SELECT mlx_groupby_bench(list(g), list(v::BIGINT)) FROM t;
+```
+
+See `test/sql/mlx_groupby_paths.test`, `mlx_groupby_stability.test`, `mlx_decline.test`.
 
 **SF10:** use `bench_roofline.sh 10` and `bench_q1.sh 10` with **lineitem-only pin** inside
 those scripts. Full `mlx_cache_pin_tpch()` on SF10 can hit Metal memory limits on 24 GB machines.
 
 Debug Q1 fast path: `SET mlx_log_level=debug;` — look for `MLX Q1 fast path: fused grid-stride`.
 
-Reference Metal patterns: [gpudb / duckdbgpumetaldbram](https://github.com/singhpratech/duckdbgpumetaldbram).
+Metal kernels use **grid-stride reductions** (capped threadgroups), **partitioned slot-lock
+hash aggregates** (no 64-bit device atomics on Apple GPUs), and **LSD radix sort** with
+on-device bucket scan for high-cardinality GROUP BY.
 
 ## Headline: plain SQL, 14× (base M4, 100M rows, hot cache)
 

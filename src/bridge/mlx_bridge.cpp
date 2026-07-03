@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1616,7 +1617,16 @@ std::vector<MlxGroupbyRow> MlxGroupbySumCached(const std::string &group_col_key,
 	mx::array vals = all_vals.size() == 1 ? all_vals[0] : mx::concatenate(all_vals, 0);
 	// full path (dense window, else sort+scatter) — dense alone returns empty
 	// for wide key spans
-	return MlxGroupbySumArrays(keys, vals, false);
+	int64_t estimated_groups = -1;
+	mx::eval(keys);
+	auto kmin = mx::min(keys).item<int64_t>();
+	auto kmax = mx::max(keys).item<int64_t>();
+	if (kmax >= kmin && kmin != INT64_MIN) {
+		auto span = static_cast<int64_t>(kmax - kmin + 1);
+		auto nrows = keys.shape(0);
+		estimated_groups = span <= nrows ? span : static_cast<int64_t>(nrows);
+	}
+	return MlxGroupbySumArrays(keys, vals, false, estimated_groups);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2417,8 +2427,156 @@ void GroupedAccumulateArrays(MlxGroupedState &state, const GroupedSegmentArrays 
 
 } // namespace
 
+static int32_t HashValueCol(const MlxSumProgram &program) {
+	if (program.ops.size() != 1 || program.ops[0].code != MlxExprOpCode::LOAD_COL) {
+		return -1;
+	}
+	return program.ops[0].col;
+}
+
+static void AppendHashRows(MlxGroupedState &state, const MlxGroupedSpec &spec, const std::vector<MlxColumnData> &cols,
+                    size_t count, int32_t val_col) {
+	if (count == 0 || spec.key_cols.empty() || val_col < 0) {
+		return;
+	}
+	auto kcol = static_cast<size_t>(spec.key_cols[0]);
+	auto vcol = static_cast<size_t>(val_col);
+	if (kcol >= cols.size() || vcol >= cols.size()) {
+		return;
+	}
+	auto &key = cols[kcol];
+	auto &val = cols[vcol];
+	state.hash_key_buf.reserve(state.hash_key_buf.size() + count);
+	state.hash_val_buf.reserve(state.hash_val_buf.size() + count);
+	for (size_t i = 0; i < count; i++) {
+		if (key.valid && key.valid[i] == 0) {
+			continue;
+		}
+		if (val.valid && val.valid[i] == 0) {
+			continue;
+		}
+		int64_t k = key.ivalues ? key.ivalues[i] : static_cast<int64_t>(key.values[i]);
+		float v = val.ivalues ? static_cast<float>(val.ivalues[i]) : val.values[i];
+		state.hash_key_buf.push_back(k);
+		state.hash_val_buf.push_back(v);
+	}
+}
+
+static void PopulateStateFromHashRows(MlxGroupedState &state, const std::vector<MlxGroupbyRow> &rows,
+                               const std::vector<MlxSumProgram> &programs) {
+	state.hash_key_emit.clear();
+	state.card = static_cast<int64_t>(rows.size());
+	auto nprogs = programs.size();
+	auto slots = static_cast<size_t>(state.card) * nprogs;
+	state.fvalues.assign(slots, 0.0);
+	state.ivalues.assign(slots, 0);
+	state.counts.assign(slots, 0);
+	state.rows.assign(static_cast<size_t>(state.card), 0);
+	state.hash_key_emit.reserve(rows.size());
+	for (size_t g = 0; g < rows.size(); g++) {
+		state.hash_key_emit.push_back(rows[g].key);
+		state.rows[g] = rows[g].count > 0 ? rows[g].count : 1;
+		for (size_t p = 0; p < nprogs; p++) {
+			auto slot = g * nprogs + p;
+			if (programs[p].kind == MlxAggKind::SUM || programs[p].kind == MlxAggKind::AVG) {
+				if (programs[p].int_lane) {
+					state.ivalues[slot] = static_cast<__int128>(static_cast<int64_t>(rows[g].sum));
+				} else {
+					state.fvalues[slot] = rows[g].sum;
+				}
+				state.counts[slot] = state.rows[g];
+			}
+		}
+	}
+}
+
+void MlxGroupedHashGroupByComplete(MlxGroupedState &state, const std::vector<MlxSumProgram> &programs,
+                                   int64_t estimated_groups) {
+	if (state.hash_key_buf.empty()) {
+		state.card = 0;
+		return;
+	}
+	mx::array keys(state.hash_key_buf.data(), {static_cast<int>(state.hash_key_buf.size())}, mx::int64);
+	mx::array vals(state.hash_val_buf.data(), {static_cast<int>(state.hash_val_buf.size())}, mx::float32);
+	auto rows = MlxGroupbySumArrays(keys, vals, false, estimated_groups);
+	PopulateStateFromHashRows(state, rows, programs);
+	state.hash_key_buf.clear();
+	state.hash_val_buf.clear();
+}
+
+void MlxGroupedHashGroupByAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                     const std::vector<MlxColumnData> &segment_cols, size_t row_count,
+                                     const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	(void)filter;
+	if (!state.hash_groupby || row_count == 0 || programs.empty()) {
+		return;
+	}
+	auto val_col = HashValueCol(programs[0]);
+	AppendHashRows(state, spec, segment_cols, row_count, val_col);
+}
+
+void MlxGroupedHashGroupByFinish(MlxGroupedState &state, const MlxGroupedSpec &spec,
+                                 const std::vector<MlxColumnData> &segment_cols, size_t row_count,
+                                 const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
+	MlxGroupedHashGroupByAccumulate(state, spec, segment_cols, row_count, programs, filter);
+	MlxGroupedHashGroupByComplete(state, programs, spec.hash_estimated_groups);
+}
+
+void MlxGroupedHashGroupByCached(MlxGroupedState &state, const std::string &group_col_key,
+                                 const std::string &value_col_key, const std::vector<MlxSumProgram> &programs,
+                                 const MlxFilter &filter, int64_t estimated_groups) {
+	if (group_col_key.empty() || value_col_key.empty() || programs.empty()) {
+		return;
+	}
+	std::vector<mx::array> key_segments;
+	std::vector<mx::array> val_segments;
+	{
+		std::lock_guard<std::mutex> guard(CacheMutex());
+		auto &store = CacheStore();
+		auto git = store.find(group_col_key);
+		auto vit = store.find(value_col_key);
+		if (git == store.end() || vit == store.end()) {
+			throw std::runtime_error("GPU cache miss for hash GROUP BY columns");
+		}
+		key_segments = git->second.segments;
+		val_segments = vit->second.segments;
+	}
+	std::vector<mx::array> all_keys;
+	std::vector<mx::array> all_vals;
+	for (size_t s = 0; s < key_segments.size(); s++) {
+		if (key_segments[s].shape(0) == 0) {
+			continue;
+		}
+		all_keys.push_back(mx::astype(mx::round(key_segments[s]), mx::int64));
+		all_vals.push_back(val_segments[s]);
+	}
+	if (all_keys.empty()) {
+		return;
+	}
+	mx::array keys = all_keys.size() == 1 ? all_keys[0] : mx::concatenate(all_keys, 0);
+	mx::array vals = all_vals.size() == 1 ? all_vals[0] : mx::concatenate(all_vals, 0);
+	if (!filter.ops.empty()) {
+		MlxSegment mega;
+		mega.count = keys.shape(0);
+		mega.cols = {keys, vals};
+		auto mask = EvalOps(mega, filter.ops);
+		mx::eval(mask);
+		keys = mx::where(mask, keys, mx::array(INT64_MIN, mx::int64));
+		vals = mx::where(mask, vals, mx::array(0.0f, mx::float32));
+	}
+	state.hash_groupby = true;
+	auto rows = MlxGroupbySumArrays(keys, vals, false, estimated_groups);
+	PopulateStateFromHashRows(state, rows, programs);
+}
+
 MlxGroupedState MlxGroupedInit(const MlxGroupedSpec &spec, const std::vector<MlxSumProgram> &programs) {
 	MlxGroupedState state;
+	if (spec.hash_groupby) {
+		state.hash_groupby = true;
+		state.nprograms = programs.size();
+		state.card = 0;
+		return state;
+	}
 	state.card = 1;
 	for (auto c : spec.key_cards) {
 		state.card *= c;
@@ -2470,6 +2628,10 @@ MlxGroupedState MlxGroupedInitLike(const MlxGroupedState &state, const std::vect
 void MlxGroupedAccumulate(MlxGroupedState &state, const MlxGroupedSpec &spec, const std::vector<MlxColumnData> &cols,
                           size_t count, const std::vector<MlxSumProgram> &programs, const MlxFilter &filter) {
 	if (count == 0) {
+		return;
+	}
+	if (state.hash_groupby) {
+		MlxGroupedHashGroupByAccumulate(state, spec, cols, count, programs, filter);
 		return;
 	}
 	auto segment = SegmentFromHost(cols, count);

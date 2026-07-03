@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -211,13 +212,36 @@ std::vector<MlxGroupbyRow> GroupbySumHash(mx::array keys, mx::array vals) {
 	return rows;
 }
 
-std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, bool use_hash) {
+std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, bool use_hash, int64_t estimated_groups) {
+	const char *path_env = GroupbyPathFromEnv();
+	if (path_env && std::strcmp(path_env, "dense") == 0) {
+		return GroupbySumDenseGpu(key_arr, val_arr);
+	}
 	if (use_hash) {
 		return GroupbySumHash(key_arr, val_arr);
 	}
 	auto dense = GroupbySumDenseGpu(key_arr, val_arr);
 	if (!dense.empty() || key_arr.shape(0) == 0) {
 		return dense;
+	}
+	if (path_env && std::strcmp(path_env, "sort") == 0) {
+		return GroupbySumSortScatter(key_arr, val_arr);
+	}
+	if (path_env && std::strcmp(path_env, "radix") == 0) {
+		return GroupbySumRadixGpu(key_arr, val_arr);
+	}
+	auto n = static_cast<int>(key_arr.shape(0));
+	if (GroupbyShouldTrySlotlock(n, estimated_groups)) {
+		auto slotlock = GroupbySumSlotlockGpu(key_arr, val_arr);
+		if (GroupbySumSlotlockValid(key_arr, val_arr, slotlock)) {
+			return slotlock;
+		}
+	}
+	if (GroupbyShouldTryRadix(n, estimated_groups)) {
+		auto radix = GroupbySumRadixGpu(key_arr, val_arr);
+		if (GroupbySumRadixValid(key_arr, val_arr, radix)) {
+			return radix;
+		}
 	}
 	return GroupbySumSortScatter(key_arr, val_arr);
 }
@@ -273,8 +297,9 @@ std::vector<MlxGroupbyRow> GroupbySumSortScatter(mx::array key_arr, mx::array va
 
 } // namespace
 
-std::vector<MlxGroupbyRow> MlxGroupbySumArrays(mx::array key_arr, mx::array val_arr, bool use_hash) {
-	return PickGpuPath(key_arr, val_arr, use_hash);
+std::vector<MlxGroupbyRow> MlxGroupbySumArrays(mx::array key_arr, mx::array val_arr, bool use_hash,
+                                               int64_t estimated_groups) {
+	return PickGpuPath(key_arr, val_arr, use_hash, estimated_groups);
 }
 
 std::vector<MlxGroupbyRow> MlxGroupbySumDenseGpuArrays(mx::array key_arr, mx::array val_arr) {
@@ -431,7 +456,7 @@ std::vector<MlxGroupbyRow> MlxGroupbySum(const int64_t *keys, const double *valu
 		key_arr = mx::where(m, key_arr, mx::array(INT64_MIN));
 		val_arr = mx::where(m, val_arr, mx::array(0.0f));
 	}
-	return PickGpuPath(key_arr, val_arr, use_hash);
+	return PickGpuPath(key_arr, val_arr, use_hash, -1);
 }
 
 double MlxGroupbyBenchSum(const int64_t *keys, const double *values, size_t count, bool use_hash) {

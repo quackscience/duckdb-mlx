@@ -6,7 +6,7 @@ require mlx
 
 statement ok
 CREATE TABLE tg AS
-SELECT (range % 100)::BIGINT AS g, (range * 3)::DOUBLE AS x
+SELECT (range % 15000)::BIGINT AS g, (range * 3)::DOUBLE AS x
 FROM range(500000);
 
 statement ok
@@ -39,6 +39,26 @@ SET mlx_execution = true;
 query I
 SELECT abs((SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg GROUP BY g) q) - getvariable('cpu_total')) /
        abs(getvariable('cpu_total')) < 1e-2;
+----
+true
+
+# medium cardinality: gpudb slot-lock path (500k rows × 5k groups)
+statement ok
+CREATE TABLE tg_med AS
+SELECT (range % 5000)::BIGINT AS g, (range * 7)::DOUBLE AS x
+FROM range(500000);
+
+statement ok
+SET VARIABLE gpu_med = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM tg_med);
+
+statement ok
+SET mlx_execution = false;
+
+statement ok
+SET VARIABLE cpu_med = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM tg_med GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_med') - getvariable('cpu_med')) / abs(getvariable('cpu_med')) < 1e-3;
 ----
 true
 

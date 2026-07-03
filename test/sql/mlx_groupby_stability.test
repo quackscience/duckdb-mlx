@@ -1,0 +1,91 @@
+# name: test/sql/mlx_groupby_stability.test
+# description: GROUP BY edge cases and path checksums (small scale, CI-safe)
+# group: [sql]
+
+require mlx
+
+# ---------------------------------------------------------------------------
+# empty input
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_empty (g BIGINT, x DOUBLE);
+
+statement ok
+SET mlx_groupby_path = 'auto';
+
+statement ok
+SET VARIABLE chk_empty = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_empty);
+
+query I
+SELECT getvariable('chk_empty') IS NULL OR getvariable('chk_empty') = 0;
+----
+true
+
+# ---------------------------------------------------------------------------
+# single row
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_one AS SELECT 42::BIGINT AS g, 99.0::DOUBLE AS x;
+
+statement ok
+SET VARIABLE chk_one = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_one);
+
+query I
+SELECT getvariable('chk_one') = 99.0;
+----
+true
+
+# ---------------------------------------------------------------------------
+# all rows share one key (span=1, dense path)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_uni AS
+SELECT 7::BIGINT AS g, (range * 11)::DOUBLE AS x
+FROM range(5000);
+
+statement ok
+SET mlx_groupby_path = 'dense';
+
+statement ok
+SET VARIABLE chk_uni = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_uni);
+
+statement ok
+SET VARIABLE ref_uni = (SELECT sum(x) FROM gb_uni);
+
+query I
+SELECT abs(getvariable('chk_uni') - getvariable('ref_uni')) / abs(getvariable('ref_uni')) < 1e-9;
+----
+true
+
+# ---------------------------------------------------------------------------
+# duplicate keys across paths must agree (same dataset, forced paths)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_paths AS
+SELECT (range % 777)::BIGINT AS g, (range * 13)::DOUBLE AS x
+FROM range(30000);
+
+statement ok
+SET VARIABLE ref_paths = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_paths GROUP BY g) q);
+
+statement ok
+SET mlx_groupby_path = 'dense';
+SET VARIABLE chk_dense = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_paths);
+
+statement ok
+SET mlx_groupby_path = 'sort';
+SET VARIABLE chk_sort = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_paths);
+
+statement ok
+SET mlx_groupby_path = 'radix';
+SET VARIABLE chk_radix = (SELECT mlx_groupby_bench(list(g), list(x::BIGINT)) FROM gb_paths);
+
+query I
+SELECT abs(getvariable('chk_dense') - getvariable('ref_paths')) / abs(getvariable('ref_paths')) < 1e-6
+   AND abs(getvariable('chk_sort') - getvariable('ref_paths')) / abs(getvariable('ref_paths')) < 1e-6
+   AND abs(getvariable('chk_radix') - getvariable('ref_paths')) / abs(getvariable('ref_paths')) < 1e-6;
+----
+true
+
+statement ok
+SET mlx_groupby_path = 'auto';

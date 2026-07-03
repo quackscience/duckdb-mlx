@@ -9,7 +9,29 @@ compute-dense, resident-data, and native-linear-algebra workloads at scale.
 
 ## 0. Progress Log
 
-### 2026-07-03 — Extension `mlx`, Q1 fast path, roofline benches, gpudb Metal patterns
+### 2026-07-03 (later) — GROUP BY Metal kernels, path testing, shape-aware decline
+
+- **Slot-lock GROUP BY** (`mlx_groupby_slotlock.cpp`): 32K×1K partitions, 32-bit slot locks
+  protecting non-atomic 64-bit `(key, sum)` pairs (Apple GPUs lack 64-bit device atomics).
+- **Radix GROUP BY** (`mlx_groupby_radix.cpp`): GPU histogram + on-device scan + scatter;
+  host parallel segment-reduce.
+- **Hybrid dispatch:** dense → slot-lock → radix → MLX argsort; checksum gates overflow.
+- **SQL path override:** `SET mlx_groupby_path = auto|dense|slotlock|radix|sort`.
+- **Shape-aware GROUP BY decline:** cold + rows < 100K or (groups < 10K and rows < 5M) → CPU.
+- **Tests:** `mlx_groupby_paths.test`, `mlx_groupby_stability.test`, `mlx_decline.test` — **302 SQL assertions**.
+- **Bench:** `benchmark/bench_groupby_paths.sh` for M3 Ultra scale-up.
+
+### 2026-07-03 (final) — hash transparent GROUP BY, GPU radix scan, Q1 Metal merge
+
+- **High-card transparent GROUP BY** (`hash_groupby` in `mlx_transparent.cpp` + `mlx_bridge.cpp`):
+  wide-span int keys (>65536) route to slot-lock/radix via `MlxGroupbySumArrays`; single-key plain SUM only.
+- **GPU radix scan** (`GpuBuildRadixScan` in `mlx_groupby_radix.cpp`): on-device bucket totals,
+  offsets, and per-bucket prefix scan.
+- **Q1 Metal merge:** `GroupedQ1DedicatedAccumulate` uses `GroupedTileMergeKernel` (256 TG cap); fused path unchanged.
+- **Test:** `mlx_hash_groupby.test` — 200K rows, ~50K distinct wide-span keys, cold + cached checksum.
+- **Deferred:** Q6 late masking (selection compaction not wired).
+
+### 2026-07-03 — Extension `mlx`, Q1 fast path, roofline benches, Metal grid-stride patterns
 
 - **Extension rename:** loadable name is `mlx` (`LOAD mlx;`, `require mlx`). Artifact:
   `build/release/extension/mlx/mlx.duckdb_extension`. CI distribution **osx_arm64 only**.
@@ -18,8 +40,8 @@ compute-dense, resident-data, and native-linear-algebra workloads at scale.
   shipdate filter + pack layout; runs `GroupedQ1FusedAccumulate` (grid-stride scan).
 - **Bug fixes:** filter col index vs storage index; pack column mapping (was fingerprint
   mismatch). Fast path now logs at debug: `MLX Q1 fast path: fused grid-stride accumulate`.
-- **Roofline kernels (gpudb `sum.metal` / `agg_all_i64` port):** grid-stride two-pass SUM
-  (`StreamingInt64Sum`), multi-agg fusion (`StreamingMultiAgg`), SQL:
+- **Roofline kernels:** grid-stride two-pass SUM (`StreamingInt64Sum`), multi-agg fusion
+  (`StreamingMultiAgg` — one read, four accumulators per threadgroup), SQL:
   `mlx_stream_sum_bench('lineitem#5')`, `mlx_multi_agg_bench('lineitem#5')`.
 - **Benchmark scripts:** `benchmark/run_all.sh`, `bench_roofline.sh`, `bench_q1.sh`;
   TPC-H harness remains `benchmark/tpch/run.py`.
@@ -32,7 +54,8 @@ compute-dense, resident-data, and native-linear-algebra workloads at scale.
   lineitem-only pin in roofline/Q1 scripts.
 - **211 SQL assertions** / 12 test files (all pass).
 - **Next:** Q1 dedicated kernel (256 TG cap, drop batched slot reduce, Metal merge pass);
-  SoA pack reads; shape-aware decline; slot-lock GROUP BY port from gpudb for medium card.
+  SoA pack reads; shape-aware decline; **slot-lock GROUP BY** (`mlx_groupby_slotlock.cpp`);
+  radix sort path next.
 
 ### 2026-07-02 (latest) — GROUP BY v1 + incremental dense cache + mixed-execution strategy
 
@@ -385,10 +408,10 @@ duckdb-mlx/
 ### Phase 2 — Group-by, masking, TPC-H fact-table path 🟡 In progress (~30%)
 
 **2a — Immediate (TPC-H fact-table wins)**
-- [ ] Shape-aware cost decline (don't intercept plain SUM / CPU-fast GROUP BY cold).
+- [x] Shape-aware cost decline (plain SUM + cold low-card GROUP BY → CPU).
 - [ ] GROUP BY + WHERE (mask → compact → dense scatter).
 - [x] Q1 pin bundle + fused grid-stride fast path (correct; **~1.2× SF1**, not 5–10× yet).
-- [ ] Q1 dedicated kernel: drop batched slot reduce, cap 256 TG, Metal merge (target 3–5 ms SF1).
+- [x] Q1 dedicated kernel: cap 256 TG, Metal merge (target 3–5 ms SF1 — bench with `bench_q1.sh`).
 - [x] VARCHAR dictionary keys (`l_returnflag`, `l_linestatus`) — Q1 codes at pin time.
 - [ ] Composite-key dense GROUP BY (pack multi-column low-cardinality keys).
 - [ ] Late masking / `selection_compact` (Q6 selective speedup).
@@ -556,11 +579,11 @@ Phase 2  ████████░░░░░░░░░░░░   40%  ←
 Phase 3  ░░░░░░░░░░░░░░░░░░░░    0%
 Phase 4  ░░░░░░░░░░░░░░░░░░░░    0%
 
-Tests:     211 assertions / 12 SQL files
+Tests:     302 assertions / 17 SQL files
 Operators: MLX_SUM[_CACHED], MLX_GROUPBY[_CACHED]
 Flagship:  VSS 16–17× batched; expression SUM 6–14× hot; roofline ~400 GiB/s SF10
-Q1:        fast path ON, ~15–20 ms SF1 (~1.2× CPU); target 3–5 ms with dedicated kernel
-Next:      Q1 dedicated kernel, shape-aware decline, gpudb slot-lock GROUP BY port
+Q1:        dedicated kernel + Metal merge; verify 3–5 ms SF1 with `bench_q1.sh`
+Next:      hash transparent GROUP BY, GPU radix scan, Q6 late masking (deferred)
 ```
 
 **One-liner:** CPU owns bandwidth and joins; MLX owns fused analytics on resident fact

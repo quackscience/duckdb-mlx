@@ -1,0 +1,81 @@
+# name: test/sql/tpch_q1_pinned.test
+# description: TPC-H Q1 through the pinned fast path (dedicated Metal kernel) must match CPU exactly
+# group: [sql]
+
+require mlx
+
+require tpch
+
+statement ok
+CALL dbgen(sf=0.1);
+
+statement ok
+SET mlx_min_rows = 1000;
+
+# CPU reference first, before any pinning.
+statement ok
+SET mlx_execution = false;
+
+statement ok
+CREATE TEMP TABLE cpu_q1 AS
+SELECT l_returnflag, l_linestatus,
+       sum(l_quantity) AS sum_qty,
+       sum(l_extendedprice) AS sum_base_price,
+       sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       avg(l_quantity) AS avg_qty,
+       avg(l_extendedprice) AS avg_price,
+       avg(l_discount) AS avg_disc,
+       count(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+statement ok
+SET mlx_execution = true;
+
+statement ok
+SELECT mlx_cache_pin_tpch();
+
+statement ok
+CREATE TEMP TABLE gpu_q1 AS
+SELECT l_returnflag, l_linestatus,
+       sum(l_quantity) AS sum_qty,
+       sum(l_extendedprice) AS sum_base_price,
+       sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       avg(l_quantity) AS avg_qty,
+       avg(l_extendedprice) AS avg_price,
+       avg(l_discount) AS avg_disc,
+       count(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+# All four Q1 groups must come back.
+query I
+SELECT count(*) FROM gpu_q1;
+----
+4
+
+# Decimal sums and counts must match the CPU engine exactly (bit-for-bit).
+query I
+SELECT count(*) FROM (
+    SELECT l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, count_order FROM cpu_q1
+    EXCEPT
+    SELECT l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, count_order FROM gpu_q1
+);
+----
+0
+
+# Averages are exact integer sums divided on the host; allow last-ulp double noise only.
+query I
+SELECT max(greatest(abs(c.avg_qty - g.avg_qty) / abs(c.avg_qty),
+                    abs(c.avg_price - g.avg_price) / abs(c.avg_price),
+                    abs(c.avg_disc - g.avg_disc) / abs(c.avg_disc))) < 1e-12
+FROM cpu_q1 c
+JOIN gpu_q1 g USING (l_returnflag, l_linestatus);
+----
+true

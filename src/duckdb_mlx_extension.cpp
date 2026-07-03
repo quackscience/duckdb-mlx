@@ -10,6 +10,7 @@
 
 #ifdef DUCKDB_MLX_GPU_ENABLED
 #include "mlx_bridge.hpp"
+#include "mlx_groupby_detail.hpp"
 #endif
 #include "mlx_transparent.hpp"
 
@@ -295,6 +296,22 @@ static void SetLogLevel(ClientContext &context, SetScope scope, Value &parameter
 	}
 }
 
+static void SetGroupbyPath(ClientContext &context, SetScope scope, Value &parameter) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto path = StringValue::Get(parameter);
+	if (path.empty() || path == "auto") {
+		duckdb_mlx::MlxGroupbySetPathOverride(nullptr);
+		return;
+	}
+	if (path != "dense" && path != "slotlock" && path != "radix" && path != "sort") {
+		throw InvalidInputException("mlx_groupby_path must be auto|dense|slotlock|radix|sort");
+	}
+	duckdb_mlx::MlxGroupbySetPathOverride(path.c_str());
+#else
+	throw NotImplementedException("mlx_groupby_path requires a GPU-enabled build of mlx");
+#endif
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 
@@ -307,6 +324,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::UBIGINT, Value::UBIGINT(524288));
 	config.AddExtensionOption("mlx_log_level", "Log verbosity of mlx (trace|debug|info|warn|error|critical|off)",
 	                          LogicalType::VARCHAR, Value("warn"), SetLogLevel);
+	config.AddExtensionOption("mlx_groupby_path",
+	                          "Force GPU GROUP BY algorithm for mlx_groupby_bench: auto|dense|slotlock|radix|sort",
+	                          LogicalType::VARCHAR, Value("auto"), SetGroupbyPath);
 
 	loader.RegisterFunction(ScalarFunction("mlx_info", {}, LogicalType::VARCHAR, MlxInfoFun));
 	loader.RegisterFunction(ScalarFunction("mlx_selftest", {}, LogicalType::VARCHAR, MlxSelftestFun));

@@ -1,0 +1,74 @@
+# name: test/sql/mlx_decline.test
+# description: shape-aware cost decline — CPU-fast shapes stay on DuckDB engine
+# group: [sql]
+
+require mlx
+
+# ---------------------------------------------------------------------------
+# Cold low-cardinality GROUP BY: CPU perfect-hash wins (rows < 100k)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_small AS
+SELECT (range % 50)::BIGINT AS g, (range * 2)::DOUBLE AS x
+FROM range(10000);
+
+statement ok
+SET mlx_execution = true;
+SET mlx_min_rows = 1000;
+
+query II
+EXPLAIN SELECT g, sum(x) FROM gb_small GROUP BY g;
+----
+physical_plan	<!REGEX>:.*MLX_GROUPBY.*
+
+statement ok
+SET VARIABLE cpu_small = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_small GROUP BY g) q);
+
+statement ok
+SET mlx_execution = true;
+
+statement ok
+SET VARIABLE gpu_small = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_small GROUP BY g) q);
+
+query I
+SELECT getvariable('cpu_small') = getvariable('gpu_small');
+----
+true
+
+# ---------------------------------------------------------------------------
+# Plain sum(col) on uncached table — scan-bound, stays CPU
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE t_plain AS SELECT (range * 1.0)::DOUBLE AS x FROM range(1000000);
+
+query II
+EXPLAIN SELECT sum(x) FROM t_plain;
+----
+physical_plan	<!REGEX>:.*MLX_SUM.*
+
+# Expression sum still intercepts (compute-dense)
+query II
+EXPLAIN SELECT sum(x * 2 + 1) FROM t_plain;
+----
+physical_plan	<REGEX>:.*MLX_SUM.*
+
+# ---------------------------------------------------------------------------
+# Hot cached GROUP BY still intercepts after warm-up (medium card, rows >= 100k)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE gb_cache AS
+SELECT (range % 15000)::BIGINT AS g, (range * 3)::DOUBLE AS x
+FROM range(200000);
+
+statement ok
+SET mlx_execution = true;
+SET mlx_min_rows = 1000;
+
+# warm cache
+statement ok
+SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_cache GROUP BY g) q;
+
+query II
+EXPLAIN SELECT g, sum(x) FROM gb_cache GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY_CACHED.*

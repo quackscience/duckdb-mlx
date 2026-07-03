@@ -754,6 +754,7 @@ struct MlxGroupKeySpec {
 	int64_t emit_base = 0; // added to the dense code when emitting the key
 	int64_t card = 0;      // plan-time estimate; refined at execution
 	bool is_varchar = false;
+	bool hash_groupby = false; // gpudb slot-lock/radix on raw int64 keys
 	string cache_key; // cache/dictionary identity
 };
 
@@ -906,6 +907,10 @@ public:
 			spec.key_offsets.push_back(keys[k].is_varchar ? 0 : keys[k].offset);
 			spec.key_cards.push_back(cards[k]);
 		}
+		if (keys.size() == 1 && keys[0].hash_groupby) {
+			spec.hash_groupby = true;
+			spec.hash_estimated_groups = keys[0].card;
+		}
 		return spec;
 	}
 
@@ -928,7 +933,11 @@ public:
 			SegmentColumns(segment, cols);
 			duckdb_mlx::MlxGroupedAccumulate(gstate.state, spec, cols, row_count, programs, no_filter);
 		}
-		duckdb_mlx::MlxGroupedGpuFinish(gstate.state, programs);
+		if (spec.hash_groupby) {
+			duckdb_mlx::MlxGroupedHashGroupByComplete(gstate.state, programs, spec.hash_estimated_groups);
+		} else {
+			duckdb_mlx::MlxGroupedGpuFinish(gstate.state, programs);
+		}
 		gstate.state_ready = true;
 
 		if (!col_keys.empty() && !skip_cache_populate) {
@@ -967,9 +976,16 @@ public:
 				}
 				auto spec = BuildSpec(source.cards);
 				source.state = duckdb_mlx::MlxGroupedInit(spec, programs);
-				duckdb_mlx::MlxGroupedAccumulateCached(source.state, spec, col_keys, programs, cache_filter,
-				                                       table_prefix);
-				duckdb_mlx::MlxGroupedGpuFinish(source.state, programs);
+				if (spec.hash_groupby) {
+					auto val_col = programs[0].ops[0].col;
+					auto val_key = col_keys[static_cast<size_t>(val_col)];
+					duckdb_mlx::MlxGroupedHashGroupByCached(source.state, keys[0].cache_key, val_key, programs,
+					                                        cache_filter, spec.hash_estimated_groups);
+				} else {
+					duckdb_mlx::MlxGroupedAccumulateCached(source.state, spec, col_keys, programs, cache_filter,
+					                                     table_prefix);
+					duckdb_mlx::MlxGroupedGpuFinish(source.state, programs);
+				}
 			} else {
 				auto &gstate = sink_state->Cast<MlxGroupedGlobalSinkState>();
 				source.state = gstate.state;
@@ -1008,7 +1024,12 @@ public:
 						FlatVector::GetData<string_t>(vec)[out] =
 						    StringVector::AddString(vec, source.dicts[k][key_codes[k]]);
 					} else {
-						auto raw = key_codes[k] + keys[k].emit_base;
+						int64_t raw;
+						if (state.hash_groupby) {
+							raw = state.hash_key_emit[static_cast<size_t>(g)];
+						} else {
+							raw = key_codes[k] + keys[k].emit_base;
+						}
 						switch (vec.GetType().InternalType()) {
 						case PhysicalType::INT64:
 							FlatVector::GetData<int64_t>(vec)[out] = raw;
@@ -1195,6 +1216,30 @@ static bool ProgramsAreCpuFast(const vector<duckdb_mlx::MlxSumProgram> &programs
 		return false;
 	}
 	return IsPlainColumnProgram(programs[0]);
+}
+
+//! gpudb hybrid_planner + PLAN §1.1 — cold GROUP BY where DuckDB CPU already wins.
+static bool GroupbyInterceptDeclineCold(idx_t estimated_rows, int64_t combined_card, bool cached, bool hash_groupby) {
+	if (cached) {
+		return false;
+	}
+	constexpr idx_t kGroupBySmallN = 100'000;
+	constexpr idx_t kGroupByMidN = 5'000'000;
+	constexpr int64_t kLowCardGroups = 10'000;
+	if (estimated_rows < kGroupBySmallN) {
+		return true;
+	}
+	if (!hash_groupby && combined_card > 0 && combined_card < kLowCardGroups && estimated_rows < kGroupByMidN) {
+		return true;
+	}
+	return false;
+}
+
+static bool IsSingleKeySumGroupBy(const LogicalAggregate &agg, const vector<MlxSumProgram> &programs) {
+	if (agg.groups.size() != 1 || programs.size() != 1) {
+		return false;
+	}
+	return programs[0].kind == MlxAggKind::SUM && IsPlainColumnProgram(programs[0]);
 }
 
 //! Cost gate for the exact int64 lane: 64-bit arithmetic is emulated on
@@ -1768,12 +1813,25 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 			}
 			auto lo = NumericStats::Min(*stats).GetValue<int64_t>();
 			auto hi = NumericStats::Max(*stats).GetValue<int64_t>();
-			if (hi < lo || hi - lo + 1 > 65536) {
+			if (hi < lo) {
 				return false;
 			}
-			key.offset = lo;
-			key.emit_base = lo - compress_offset;
-			key.card = hi - lo + 1;
+			auto span = hi - lo + 1;
+			auto distinct = stats->GetDistinctCount();
+			constexpr int64_t kHashMaxGroups = 16'000'000;
+			if (span > 65536) {
+				if (distinct == 0 || distinct > kHashMaxGroups) {
+					return false;
+				}
+				key.hash_groupby = true;
+				key.card = NumericCast<int64_t>(distinct);
+				key.offset = 0;
+				key.emit_base = 0;
+			} else {
+				key.offset = lo;
+				key.emit_base = lo - compress_offset;
+				key.card = span;
+			}
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
@@ -1790,7 +1848,10 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 			return false;
 		}
 		combined_card *= key.card;
-		if (combined_card > 65536) {
+		if (combined_card > 16'000'000) {
+			return false;
+		}
+		if (!key.hash_groupby && combined_card > 65536) {
 			return false;
 		}
 		key_storage_cols.insert(NumericCast<int32_t>(storage_col));
@@ -1883,6 +1944,13 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 	vector<MlxSumProgram> programs;
 	vector<LogicalType> agg_types;
 	if (!BuildAggregatePrograms(context, get, projs, agg, estimated_rows, true, programs, agg_types)) {
+		return false;
+	}
+	bool hash_groupby = false;
+	for (auto &key : keys) {
+		hash_groupby = hash_groupby || key.hash_groupby;
+	}
+	if (hash_groupby && !IsSingleKeySumGroupBy(agg, programs)) {
 		return false;
 	}
 
@@ -1979,6 +2047,13 @@ static bool TryInterceptGroupBy(ClientContext &context, unique_ptr<LogicalOperat
 		if (cached) {
 			duckdb_mlx::MlxCacheBindDerivedPrograms(table_prefix, col_keys, programs);
 		}
+	}
+
+	if (GroupbyInterceptDeclineCold(estimated_rows, combined_card, cached, hash_groupby)) {
+		duckdb_mlx::LogDebug("MLX_GROUPBY declined: CPU-faster shape (rows=" + std::to_string(estimated_rows) +
+		                     " groups=" + std::to_string(combined_card) + " cached=" + (cached ? "true" : "false") +
+		                     ")");
+		return false;
 	}
 
 	get->projection_ids = std::move(scan_projection);

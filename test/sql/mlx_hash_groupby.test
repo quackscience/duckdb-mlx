@@ -1,0 +1,51 @@
+# name: test/sql/mlx_hash_groupby.test
+# description: transparent hash GROUP BY (wide span, gpudb slot-lock path)
+# group: [sql]
+
+require mlx
+
+# Keys have huge min-max span but ~50k distinct values — dense path cannot work.
+statement ok
+CREATE TABLE gb_wide AS
+SELECT (range % 50000)::BIGINT * 1000000 AS g, (range * 11)::DOUBLE AS x
+FROM range(200000);
+
+statement ok
+ANALYZE gb_wide;
+
+statement ok
+SET mlx_execution = true;
+SET mlx_min_rows = 1000;
+
+query II
+EXPLAIN SELECT g, sum(x) FROM gb_wide GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY.*
+
+statement ok
+SET VARIABLE cpu_h = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_wide GROUP BY g) q);
+
+statement ok
+SET mlx_execution = true;
+
+statement ok
+SET VARIABLE gpu_h = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_wide GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_h') - getvariable('cpu_h')) / abs(getvariable('cpu_h')) < 1e-3;
+----
+true
+
+# hot cached hash GROUP BY
+query II
+EXPLAIN SELECT g, sum(x) FROM gb_wide GROUP BY g;
+----
+physical_plan	<REGEX>:.*MLX_GROUPBY_CACHED.*
+
+statement ok
+SET VARIABLE gpu_hot = (SELECT sum(s) FROM (SELECT sum(x) AS s FROM gb_wide GROUP BY g) q);
+
+query I
+SELECT abs(getvariable('gpu_hot') - getvariable('cpu_h')) / abs(getvariable('cpu_h')) < 1e-2;
+----
+true
