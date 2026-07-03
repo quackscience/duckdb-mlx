@@ -1,9 +1,13 @@
-build
-.cache
-.idea
-cmake-build-debug
+build/
+.cache/
+.idea/
+cmake-build-debug/
 duckdb_unittest_tempdir/
 .DS_Store
-testext
+testext/
 test/python/__pycache__/
 .Rhistory
+
+# Generated / local only — never commit
+benchmark/tpch/results/*.duckdb
+*.duckdb
