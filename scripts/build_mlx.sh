@@ -18,18 +18,7 @@ fi
 # MLX compiles Metal shaders at build time (xcrun metal). Command Line Tools alone
 # are not enough — full Xcode must be installed and selected.
 if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-	echo "ERROR: Metal compiler not found (xcrun metal)." >&2
-	echo "" >&2
-	echo "duckdb-mlx requires the full Xcode app, not only Command Line Tools." >&2
-	echo "  1. Install Xcode from the App Store" >&2
-	echo "  2. sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
-	echo "  3. sudo xcodebuild -license accept" >&2
-	echo "  4. xcrun -sdk macosx metal --version   # should print a version" >&2
-	devdir="$(xcode-select -p 2>/dev/null || true)"
-	if [ -n "$devdir" ]; then
-		echo "" >&2
-		echo "Current developer directory: $devdir" >&2
-	fi
+	"${ROOT}/scripts/check_toolchain.sh" >&2 || true
 	exit 1
 fi
 

@@ -127,20 +127,45 @@ and MLX/spdlog headers. Data crosses the bridge as raw unified-memory pointers.
 
 ## Building
 
-Requires **macOS 14+**, **full Xcode** (App Store — Command Line Tools alone are not
-enough), CMake, and ninja. MLX compiles Metal shaders during the build; verify the
-toolchain before `make`:
+Requires **macOS 14+**, **full Xcode.app** (Apple's IDE — not Command Line Tools alone),
+CMake, and ninja. MLX compiles Metal shaders during the build.
+
+**There is no Homebrew formula for the Metal compiler.** `brew install` packages like
+`cmake` / `ninja` are fine, but Xcode itself must come from the **App Store** or the
+[`xcodes`](https://github.com/XcodesOrg/xcodes) CLI.
+
+Check the toolchain (run this before `make`):
 
 ```shell
-xcrun -sdk macosx metal --version
+./scripts/check_toolchain.sh
 ```
 
-If that fails:
+You need `xcrun -sdk macosx metal --version` to succeed. If it fails and
+`xcode-select -p` shows `/Library/Developer/CommandLineTools`, full Xcode is not
+active yet.
+
+**App Store (simplest):** install Xcode, open it once, then:
 
 ```shell
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
+xcrun -sdk macosx metal --version
 ```
+
+**Homebrew + xcodes** (when App Store/Xcode path is not `/Applications/Xcode.app`):
+
+```shell
+brew install xcodesorg/made/xcodes
+xcodes install --latest
+xcodes select --latest
+xcodes run --latest
+sudo xcodebuild -license accept
+xcrun -sdk macosx metal --version
+```
+
+If Xcode lives elsewhere (e.g. `/Applications/Xcode-16.4.0.app`), point
+`xcode-select` at that bundle's `Contents/Developer` (the check script prints the
+exact path).
 
 Portable C++ dependencies (currently **spdlog**) are declared in `vcpkg.json` and
 installed automatically on first build — `make` bootstraps a local `vcpkg/` checkout
@@ -148,7 +173,7 @@ if needed. MLX is vendored as a submodule and built into `build/mlx-install` on 
 configure (`scripts/build_mlx.sh`, Metal-only — no JACCL/CPU backend).
 
 ```shell
-git submodule update --init --recursive   # duckdb v1.5.4, extension-ci-tools, mlx
+git submodule update --init --recursive
 GEN=ninja make release
 ```
 
