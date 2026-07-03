@@ -127,18 +127,29 @@ and MLX/spdlog headers. Data crosses the bridge as raw unified-memory pointers.
 
 ## Building
 
-Portable C++ dependencies are managed with [vcpkg](https://vcpkg.io) (`vcpkg.json`;
-currently spdlog). MLX is vendored as a submodule and built automatically into
-`build/mlx-install` on first configure (`scripts/build_mlx.sh`). Requires macOS 14+,
-Xcode (for the Metal compiler), CMake and ninja.
+Requires macOS 14+, Xcode (Metal compiler), CMake, and ninja. Portable C++
+dependencies (currently **spdlog**) are declared in `vcpkg.json` and installed
+automatically on first build — `make` bootstraps a local `vcpkg/` checkout if
+needed. MLX is vendored as a submodule and built into `build/mlx-install` on
+first configure (`scripts/build_mlx.sh`).
 
 ```shell
-git clone https://github.com/Microsoft/vcpkg.git && ./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-
-git submodule update --init          # duckdb v1.5.4, extension-ci-tools, mlx v0.31.2
+git submodule update --init --recursive   # duckdb v1.5.4, extension-ci-tools, mlx
 GEN=ninja make release
 ```
+
+If an earlier `make release` failed before vcpkg was set up, clear the stale CMake
+cache and rebuild:
+
+```shell
+rm -rf build/release
+GEN=ninja make release
+```
+
+(`make release` also detects and removes poisoned caches automatically.)
+
+To use a system-wide vcpkg install instead, set `VCPKG_TOOLCHAIN_PATH` before
+`make` (see [DuckDB extension vcpkg docs](duckdb/extension/README.md)).
 
 Main artifacts:
 
