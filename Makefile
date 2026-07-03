@@ -50,4 +50,12 @@ fix-stale-vcpkg-cache:
 	  fi; \
 	done
 
-release debug relassert reldebug test_release_internal test_debug_internal test_reldebug_internal tidy-check clangd: setup-vcpkg-deps fix-stale-vcpkg-cache
+release debug relassert reldebug test_release_internal test_debug_internal test_reldebug_internal clangd: setup-vcpkg-deps fix-stale-vcpkg-cache
+
+# extension-ci-tools tidy-check omits VCPKG_MANIFEST_FLAGS; override for CI/local.
+.PHONY: tidy-check
+tidy-check: setup-vcpkg-deps fix-stale-vcpkg-cache
+	mkdir -p ./build/tidy
+	cmake $(GENERATOR) $(BUILD_FLAGS) $(EXT_DEBUG_FLAGS) $(VCPKG_MANIFEST_FLAGS) -DDUCKDB_MLX_ENABLE_GPU=OFF -DDISABLE_UNITY=1 -DCLANG_TIDY=1 -S $(DUCKDB_SRCDIR) -B build/tidy
+	cp duckdb/.clang-tidy build/tidy/.clang-tidy
+	cd build/tidy && python3 ../../duckdb/scripts/run-clang-tidy.py '$(PROJ_DIR)src/.*/' -header-filter '$(PROJ_DIR)src/.*/' -quiet ${TIDY_THREAD_PARAMETER} ${TIDY_BINARY_PARAMETER} ${TIDY_PERFORM_CHECKS}

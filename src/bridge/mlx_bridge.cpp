@@ -745,6 +745,11 @@ struct MlxQ1PinBundle {
 	int32_t group_card = 0;
 	int32_t val_n = 0;
 	std::vector<uint64_t> pack_fps;
+	//! v2 (dedicated kernel): uint8 codes with the shipdate filter folded in,
+	//! plus deduplicated value lanes; pack column i reads lane v2_dist_of_pack[i].
+	bool v2_ok = false;
+	int32_t v2_dist_n = 0;
+	std::vector<int32_t> v2_dist_of_pack;
 };
 
 std::unordered_map<std::string, MlxQ1PinBundle> &Q1PinBundles() {
@@ -975,8 +980,9 @@ void MlxCacheMaterializeLineitemTpch(const std::string &table_prefix, int col_ex
 	auto tax_key = table_prefix + std::to_string(col_tax);
 	std::vector<std::string> ep_disc_keys = {ep_key, disc_key};
 
-	std::vector<MlxExprOp> disc_price_ops = {{MlxExprOpCode::LOAD_COL, 1, 0},
-	                                         {MlxExprOpCode::CONST_VAL, 0, 0.0, decimal_one_scaled, true},
+	// (1 - disc) * price: postfix SUB computes first-pushed minus second-pushed
+	std::vector<MlxExprOp> disc_price_ops = {{MlxExprOpCode::CONST_VAL, 0, 0.0, decimal_one_scaled, true},
+	                                         {MlxExprOpCode::LOAD_COL, 1, 0},
 	                                         {MlxExprOpCode::SUB, 0, 0},
 	                                         {MlxExprOpCode::LOAD_COL, 0, 0},
 	                                         {MlxExprOpCode::MUL, 0, 0}};
@@ -1059,6 +1065,12 @@ void MaterializeLineitemQ1Unlocked(const std::string &table_prefix, int col_ship
 	}
 	auto n = store[ship_key].rows;
 	auto population = store[ship_key].population;
+	bool nullable = false;
+	for (auto &key : {ship_key, rf_key, ls_key, qty_key, ep_key, disc_key, disc_price_key, charge_key}) {
+		if (store[key].fused_valid.has_value()) {
+			nullable = true;
+		}
+	}
 
 	auto &ship = *store[ship_key].fused_col;
 	mx::array pass =
@@ -1096,6 +1108,43 @@ void MaterializeLineitemQ1Unlocked(const std::string &table_prefix, int col_ship
 	bundle.pack_fps = {FingerprintLoadCol(qty_key),    FingerprintLoadCol(ep_key),  FingerprintLoadCol(disc_price_key),
 	                   FingerprintLoadCol(charge_key), FingerprintLoadCol(qty_key), FingerprintLoadCol(ep_key),
 	                   FingerprintLoadCol(disc_key)};
+
+	// v2 for the dedicated kernel: fold the filter into uint8 codes (failing rows
+	// carry code == card, the dump slot) and deduplicate the value lanes, storing
+	// each as int32 when its per-row bound fits. Counts are derived from group row
+	// counts, so v2 requires every lane NULL-free.
+	if (!nullable && bundle.group_card > 0 && bundle.group_card < 255) {
+		auto card_arr = mx::array(bundle.group_card, mx::int32);
+		auto in_range = mx::logical_and(mx::greater_equal(codes, mx::array(0, mx::int32)), mx::less(codes, card_arr));
+		auto keep = mx::logical_and(mx::astype(pass, mx::bool_), in_range);
+		auto codes8 = mx::astype(mx::where(keep, codes, card_arr), mx::uint8);
+
+		// Pack order is {qty, ep, disc_price, charge, qty, ep, disc}; distinct
+		// lanes in first-appearance order.
+		std::vector<std::string> dist_keys = {qty_key, ep_key, disc_price_key, charge_key, disc_key};
+		std::vector<mx::array> dists;
+		dists.reserve(dist_keys.size());
+		std::vector<mx::array> to_eval = {codes8};
+		for (auto &key : dist_keys) {
+			auto col = *store[key].fused_col;
+			auto lane = col.dtype() == mx::int64 ? col : mx::astype(col, mx::int64);
+			auto abs_max = mx::max(mx::abs(lane));
+			mx::eval(abs_max);
+			if (abs_max.item<int64_t>() < (1LL << 31)) {
+				lane = mx::astype(lane, mx::int32);
+			}
+			dists.push_back(lane);
+			to_eval.push_back(lane);
+		}
+		mx::eval(to_eval);
+		StoreFusedDerivedUnlocked(table_prefix + "x:q1v2_codes", codes8, n, population);
+		for (size_t i = 0; i < dists.size(); i++) {
+			StoreFusedDerivedUnlocked(table_prefix + "x:q1v2_v" + std::to_string(i), dists[i], n, population);
+		}
+		bundle.v2_dist_n = static_cast<int32_t>(dists.size());
+		bundle.v2_dist_of_pack = {0, 1, 2, 3, 0, 1, 4};
+		bundle.v2_ok = true;
+	}
 	Q1PinBundles()[table_prefix] = std::move(bundle);
 }
 
@@ -1143,6 +1192,8 @@ bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_pref
 	std::optional<mx::array> codes;
 	std::optional<mx::array> pass;
 	std::optional<mx::array> packed;
+	std::optional<mx::array> codes8;
+	std::vector<mx::array> dist_cols;
 	{
 		std::lock_guard<std::mutex> guard(CacheMutex());
 		auto &store = CacheStore();
@@ -1157,9 +1208,37 @@ bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_pref
 		codes = *codes_it->second.fused_col;
 		pass = *pass_it->second.fused_col;
 		packed = *pack_it->second.fused_col;
+		if (bundle.v2_ok && bundle.v2_dist_n > 0 &&
+		    bundle.v2_dist_of_pack.size() == static_cast<size_t>(bundle.val_n)) {
+			auto c8_it = store.find(table_prefix + "x:q1v2_codes");
+			if (c8_it != store.end() && c8_it->second.fused_col.has_value()) {
+				codes8 = *c8_it->second.fused_col;
+				for (int32_t i = 0; i < bundle.v2_dist_n; i++) {
+					auto v_it = store.find(table_prefix + "x:q1v2_v" + std::to_string(i));
+					if (v_it == store.end() || !v_it->second.fused_col.has_value()) {
+						codes8.reset();
+						dist_cols.clear();
+						break;
+					}
+					dist_cols.push_back(*v_it->second.fused_col);
+				}
+			}
+		}
 	}
 	if (!GroupedTileKernelEligible(programs, state.card)) {
 		return false;
+	}
+	if (codes8.has_value()) {
+		try {
+			GroupedQ1DedicatedAccumulate(state, *codes8, dist_cols, bundle.v2_dist_of_pack, val_slots, programs);
+			duckdb_mlx::LogDebug("MLX Q1 fast path: dedicated kernel (" + std::to_string(codes8->shape(0)) + " rows)");
+			return true;
+		} catch (std::exception &ex) {
+			duckdb_mlx::LogDebug(std::string("MLX Q1 fast path: dedicated kernel failed (") + ex.what() +
+			                     "), falling back");
+		} catch (...) {
+			duckdb_mlx::LogDebug("MLX Q1 fast path: dedicated kernel failed, falling back");
+		}
 	}
 	try {
 		GroupedQ1FusedAccumulate(state, *codes, *pass, *packed, static_cast<int>(val_slots.size()), val_slots,
@@ -1307,6 +1386,10 @@ MlxPopulationPlan MlxCacheBeginPopulation(const std::string &table_prefix, const
 	return plan;
 }
 
+namespace {
+static constexpr size_t kCacheZoneMapSegmentRows = 1'000'000;
+} // namespace
+
 void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &col_keys,
                           const std::vector<bool> &store_col, const std::vector<MlxColumnData> &cols, size_t count) {
 	if (count == 0) {
@@ -1326,13 +1409,18 @@ void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &co
 	auto canonical = CanonicalSegmentSizesUnlocked(table_prefix);
 
 	if (canonical.empty()) {
-		for (size_t i = 0; i < col_keys.size(); i++) {
-			if (i >= store_col.size() || !store_col[i]) {
-				continue;
+		size_t offset = 0;
+		while (offset < count) {
+			size_t take = std::min(kCacheZoneMapSegmentRows, count - offset);
+			for (size_t i = 0; i < col_keys.size(); i++) {
+				if (i >= store_col.size() || !store_col[i]) {
+					continue;
+				}
+				AppendColumnSlice(store[col_keys[i]], cols[i], offset, take, population);
 			}
-			AppendColumnSlice(store[col_keys[i]], cols[i], 0, count, population);
+			layout.segment_sizes.push_back(take);
+			offset += take;
 		}
-		layout.segment_sizes.push_back(count);
 		return;
 	}
 
@@ -1349,6 +1437,8 @@ void MlxCacheStoreSegment(int64_t population, const std::vector<std::string> &co
 		size_t take = count - offset;
 		if (seg_idx < canonical.size()) {
 			take = std::min(take, canonical[seg_idx]);
+		} else {
+			take = std::min(take, kCacheZoneMapSegmentRows);
 		}
 		for (size_t i = 0; i < col_keys.size(); i++) {
 			if (i >= store_col.size() || !store_col[i]) {
