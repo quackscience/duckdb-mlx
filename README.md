@@ -127,11 +127,25 @@ and MLX/spdlog headers. Data crosses the bridge as raw unified-memory pointers.
 
 ## Building
 
-Requires macOS 14+, Xcode (Metal compiler), CMake, and ninja. Portable C++
-dependencies (currently **spdlog**) are declared in `vcpkg.json` and installed
-automatically on first build — `make` bootstraps a local `vcpkg/` checkout if
-needed. MLX is vendored as a submodule and built into `build/mlx-install` on
-first configure (`scripts/build_mlx.sh`, Metal-only — no JACCL/CPU backend).
+Requires **macOS 14+**, **full Xcode** (App Store — Command Line Tools alone are not
+enough), CMake, and ninja. MLX compiles Metal shaders during the build; verify the
+toolchain before `make`:
+
+```shell
+xcrun -sdk macosx metal --version
+```
+
+If that fails:
+
+```shell
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -license accept
+```
+
+Portable C++ dependencies (currently **spdlog**) are declared in `vcpkg.json` and
+installed automatically on first build — `make` bootstraps a local `vcpkg/` checkout
+if needed. MLX is vendored as a submodule and built into `build/mlx-install` on first
+configure (`scripts/build_mlx.sh`, Metal-only — no JACCL/CPU backend).
 
 ```shell
 git submodule update --init --recursive   # duckdb v1.5.4, extension-ci-tools, mlx
