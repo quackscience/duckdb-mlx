@@ -2,7 +2,7 @@
 # description: Phase 0 spike 2 — differential test: GPU reduction over DuckDB data matches CPU
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 CREATE TABLE numbers AS SELECT (range * 7919) % 1000003 AS x FROM range(1000000);

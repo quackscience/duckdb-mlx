@@ -2,7 +2,7 @@
 # description: Phase 1 — transparent GPU execution of ungrouped SUM aggregations
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 CREATE TABLE t AS SELECT ((range * 7919) % 1000003)::DOUBLE AS x, ((range * 13) % 97 + 1)::DOUBLE AS y

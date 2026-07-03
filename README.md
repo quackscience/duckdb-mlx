@@ -2,22 +2,41 @@
 
 GPU-accelerated DuckDB on Apple Silicon (Metal / MLX).
 
-`duckdb_mlx` is a loadable DuckDB extension that executes analytical workloads on the
-Apple Silicon GPU. See [docs/PLAN.md](docs/PLAN.md) for the full architecture and
-roadmap; the design ports concepts from NVIDIA GQE and Sirius, re-derived for unified
-memory. Progress is test-gated: every capability lands with a passing differential test
-against DuckDB's own CPU results before it is committed.
+The loadable extension is named **`mlx`** (`LOAD mlx;`). See [docs/PLAN.md](docs/PLAN.md) for
+architecture and roadmap. Progress is test-gated: every capability lands with a passing
+differential test against DuckDB's CPU engine before it is committed.
 
-**Status:** Transparent GPU acceleration is live. An optimizer hook intercepts supported
-plans, and a GPU-resident column cache (the GQE "in-memory table format", unified-memory
-edition) serves repeated queries with **no table scan at all**, fused into a few Metal
-kernels by `mx::compile`.
+**Status (2026-07-03):** Transparent GPU acceleration is live. Optimizer intercepts supported
+plans; GPU-resident column cache serves repeated queries without rescanning. TPC-H Q1 uses a
+**pin-time bundle + fused Metal grid-stride kernel** (fast path; see benchmarks below). Roofline
+microbenches (`mlx_stream_sum_bench`, `mlx_multi_agg_bench`) reach **~50 GiB/s SF1 / ~400+ GiB/s
+SF10** on pinned lineitem — grouped Q1 still **~15–20 ms SF1** (~1.2× CPU); dedicated low-card
+kernel is next (see PLAN §2a).
+
+## Quick benchmark (repeatable)
+
+```shell
+GEN=ninja make release
+./build/release/test/unittest "[sql]"          # 211 assertions, 12 SQL files
+
+benchmark/run_all.sh 1                         # minimal + roofline + Q1 @ SF1
+benchmark/bench_roofline.sh 1                  # stream SUM + multi-agg GiB/s
+benchmark/bench_q1.sh 1                        # official TPC-H Q1 CPU vs GPU (pinned)
+python3 benchmark/tpch/run.py 1                # full 22-query GQE harness
+```
+
+**SF10:** use `bench_roofline.sh 10` and `bench_q1.sh 10` with **lineitem-only pin** inside
+those scripts. Full `mlx_cache_pin_tpch()` on SF10 can hit Metal memory limits on 24 GB machines.
+
+Debug Q1 fast path: `SET mlx_log_level=debug;` — look for `MLX Q1 fast path: fused grid-stride`.
+
+Reference Metal patterns: [gpudb / duckdbgpumetaldbram](https://github.com/singhpratech/duckdbgpumetaldbram).
 
 ## Headline: plain SQL, 14× (base M4, 100M rows, hot cache)
 
 ```sql
-LOAD 'duckdb_mlx';
-SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;  -- that's it. no special syntax.
+LOAD mlx;
+SELECT sum(sin(x) * cos(x) + sqrt(abs(x) + 1)) FROM t;  -- plain SQL, no special syntax
 ```
 
 | Query (100M rows) | DuckDB CPU (all cores) | duckdb-mlx GPU (hot) | Speedup |
@@ -43,7 +62,7 @@ the CPU engine to ~1e-7 relative in testing).
 ## Flagship: GPU-resident vector search
 
 ```sql
-LOAD 'duckdb_mlx';
+LOAD mlx;
 
 -- one-time: pin an embedding column as a GPU-resident, L2-normalized matrix
 SELECT mlx_vss_pin('items', list(emb ORDER BY id)) FROM items;
@@ -73,17 +92,18 @@ Pin cost is ~5 s one-time and amortizes across all queries. Reproduce with
 |---|---|
 | `mlx_info()` | extension/GPU/MLX/spdlog status string |
 | `mlx_selftest()` | end-to-end GPU sanity check, returns `ok` |
+| `mlx_cache_pin(table)` / `mlx_cache_pin_tpch()` | GPU-resident column cache |
+| `mlx_stream_sum_bench(col_key)` | roofline SUM on pinned column (`lineitem#5`) |
+| `mlx_multi_agg_bench(col_key)` | roofline SUM+MIN+MAX+COUNT fusion on pinned column |
 | `mlx_vss_pin(name, list(col))` | pin a `FLOAT[N]` column as a GPU-resident matrix |
 | `mlx_vss_search(name, query, k)` | cosine top-k against a pinned matrix |
 | `mlx_vss_search_batch(name, queries, k)` | batched top-k, one matmul |
 | `mlx_sum(BIGINT[])`, `mlx_expr_bench(BIGINT[])` | Phase 0 spike/benchmark vehicles |
 
-Settings: `mlx_execution` (reserved for the Phase 1 optimizer hook), `mlx_min_rows`,
-`mlx_log_level`.
+Settings: `mlx_execution` (opt-in GPU plans), `mlx_min_rows`, `mlx_log_level`.
 
 The extension builds on all DuckDB platforms; the GPU path is compiled in only on Apple
-Silicon (`DUCKDB_MLX_ENABLE_GPU`, auto-detected) and GPU functions raise clean errors
-elsewhere.
+Silicon (`DUCKDB_MLX_ENABLE_GPU`, auto-detected). CI distribution builds **osx_arm64 only**.
 
 ## Repository layout
 
@@ -125,17 +145,19 @@ Main artifacts:
 ```shell
 ./build/release/duckdb                                            # shell, extension pre-loaded
 ./build/release/test/unittest                                     # test runner
-./build/release/extension/duckdb_mlx/duckdb_mlx.duckdb_extension  # loadable extension
+./build/release/extension/mlx/mlx.duckdb_extension  # loadable extension
 ```
 
 ## Testing
 
 ```shell
 GEN=ninja make test
+# or:
+./build/release/test/unittest "[sql]"
 ```
 
-SQL logic tests live in `test/sql/`; every GPU capability is diffed against DuckDB's CPU
-results (the permanent differential harness from docs/PLAN.md Phase 1).
+SQL logic tests live in `test/sql/` (`require mlx;`). Every GPU capability is diffed against
+DuckDB's CPU results.
 
 ## License
 

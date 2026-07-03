@@ -106,7 +106,7 @@ def build_script(
     pin_tpch: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     script = [
-        "LOAD duckdb_mlx;",
+        "LOAD mlx;",
         "LOAD tpch;",
         ".timer on",
         ".mode csv",

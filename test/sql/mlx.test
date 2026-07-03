@@ -1,5 +1,5 @@
-# name: test/sql/duckdb_mlx.test
-# description: test duckdb_mlx extension loading, settings and info function
+# name: test/sql/mlx.test
+# description: test mlx extension loading, settings and info function
 # group: [sql]
 
 # Before we load the extension, this will fail
@@ -9,11 +9,11 @@ SELECT mlx_info();
 Catalog Error: Scalar Function with name mlx_info does not exist!
 
 # Require statement will ensure this test is run with this extension loaded
-require duckdb_mlx
+require mlx
 
 # Confirm the extension loaded and reports its status
 query I
-SELECT mlx_info() LIKE 'duckdb_mlx gpu=% mlx=% spdlog=%';
+SELECT mlx_info() LIKE 'mlx gpu=% mlx=% spdlog=%';
 ----
 true
 

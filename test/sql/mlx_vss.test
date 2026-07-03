@@ -2,7 +2,7 @@
 # description: GPU-resident cosine top-k matches DuckDB's array_cosine_similarity
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 # Deterministic, tie-free embeddings
 statement ok

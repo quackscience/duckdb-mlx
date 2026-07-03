@@ -9,6 +9,31 @@ compute-dense, resident-data, and native-linear-algebra workloads at scale.
 
 ## 0. Progress Log
 
+### 2026-07-03 — Extension `mlx`, Q1 fast path, roofline benches, gpudb Metal patterns
+
+- **Extension rename:** loadable name is `mlx` (`LOAD mlx;`, `require mlx`). Artifact:
+  `build/release/extension/mlx/mlx.duckdb_extension`. CI distribution **osx_arm64 only**.
+- **Q1 pin-time bundle:** `x:pass_q1`, `x:q1_codes`, `x:q1_pack` materialized at
+  `mlx_cache_pin('lineitem')` / `mlx_cache_pin_tpch()`. `TryLineitemQ1FastPath` matches
+  shipdate filter + pack layout; runs `GroupedQ1FusedAccumulate` (grid-stride scan).
+- **Bug fixes:** filter col index vs storage index; pack column mapping (was fingerprint
+  mismatch). Fast path now logs at debug: `MLX Q1 fast path: fused grid-stride accumulate`.
+- **Roofline kernels (gpudb `sum.metal` / `agg_all_i64` port):** grid-stride two-pass SUM
+  (`StreamingInt64Sum`), multi-agg fusion (`StreamingMultiAgg`), SQL:
+  `mlx_stream_sum_bench('lineitem#5')`, `mlx_multi_agg_bench('lineitem#5')`.
+- **Benchmark scripts:** `benchmark/run_all.sh`, `bench_roofline.sh`, `bench_q1.sh`;
+  TPC-H harness remains `benchmark/tpch/run.py`.
+- **Measured (M4 24 GB, hot, lineitem pinned):**
+  - Stream SUM SF1: **~50–90 GiB/s**; SF10: **~400+ GiB/s**
+  - Multi-agg SF10: **~450–680 GiB/s** (one column read, four accumulators)
+  - TPC-H Q1 SF1: GPU **~15–20 ms** vs CPU **~20 ms** (~1.2×) — fast path on, but grouped
+    slot reduction still ~100+ barriers/TG; target **3–5 ms** with dedicated Q1 kernel
+- **SF10 caveat:** full `mlx_cache_pin_tpch()` can OOM (Metal resource limit); use
+  lineitem-only pin in roofline/Q1 scripts.
+- **211 SQL assertions** / 12 test files (all pass).
+- **Next:** Q1 dedicated kernel (256 TG cap, drop batched slot reduce, Metal merge pass);
+  SoA pack reads; shape-aware decline; slot-lock GROUP BY port from gpudb for medium card.
+
 ### 2026-07-02 (latest) — GROUP BY v1 + incremental dense cache + mixed-execution strategy
 
 - **GROUP BY transparent interception:** `MLX_GROUPBY` / `MLX_GROUPBY_CACHED` for single
@@ -22,8 +47,8 @@ compute-dense, resident-data, and native-linear-algebra workloads at scale.
   ~G group rows, not N fact rows — **<1 ms vs CPU ~2–5 ms** on 5M rows / 1K groups (M4).
 - **Cold path:** CPU double dense accumulate (accurate); GPU upload only when dense span
   exceeds host path or hash fallback needed.
-- **Benchmark harness:** `benchmark/bench_minimal.sql` + `run_minimal.sh`; TPC-H runner
-  at `benchmark/tpch/run.sh` (GQE 5-run hot methodology).
+- **Benchmark harness:** `benchmark/bench_minimal.sql` + `run_minimal.sh`;
+  `benchmark/tpch/run.py` (GQE 5-run hot methodology).
 - **Measured (M4 base, minimal bench):** expression SUM 10M hot ~3 ms vs CPU ~19 ms
   (**~6×**); plain `sum(col)` parity (~2 ms); GROUP BY 5M hot **<1 ms** vs CPU ~5 ms;
   selective filtered multi-agg parity (compute-then-mask regression confirmed).
@@ -103,7 +128,7 @@ expression forests, resident fact-table analytics, incremental partial aggregate
 native linear algebra (embeddings, matmul-heavy workloads).
 
 ```sql
-LOAD 'duckdb_mlx';
+LOAD mlx;
 SET mlx_execution = true;
 
 -- GPU when shape + cost model say so (expression-heavy, cached, compute-dense):
@@ -330,7 +355,8 @@ duckdb-mlx/
 - Language: C++17 linking `mlx::core`; Metal via `mx.fast.metal_kernel` inline.
 - Platform: macOS 14+ arm64; CI on GitHub Actions macos arm64 runners.
 - Build: `GEN=ninja make release`; tests: `./build/release/test/unittest "[sql]"`.
-- Benchmark: `./benchmark/run_minimal.sh` or `./benchmark/tpch/run.sh 1`.
+- Benchmark: `./benchmark/run_minimal.sh`, `./benchmark/run_all.sh 1`, or
+  `python3 benchmark/tpch/run.py 1`.
 
 ---
 
@@ -361,11 +387,12 @@ duckdb-mlx/
 **2a — Immediate (TPC-H fact-table wins)**
 - [ ] Shape-aware cost decline (don't intercept plain SUM / CPU-fast GROUP BY cold).
 - [ ] GROUP BY + WHERE (mask → compact → dense scatter).
-- [ ] Multi-aggregate GROUP BY (Q1: 6 aggs in one fused pass).
-- [ ] VARCHAR dictionary keys (`l_returnflag`, `l_linestatus`).
+- [x] Q1 pin bundle + fused grid-stride fast path (correct; **~1.2× SF1**, not 5–10× yet).
+- [ ] Q1 dedicated kernel: drop batched slot reduce, cap 256 TG, Metal merge (target 3–5 ms SF1).
+- [x] VARCHAR dictionary keys (`l_returnflag`, `l_linestatus`) — Q1 codes at pin time.
 - [ ] Composite-key dense GROUP BY (pack multi-column low-cardinality keys).
 - [ ] Late masking / `selection_compact` (Q6 selective speedup).
-- [ ] `mlx_pin('lineitem')` pre-warm for benchmark suite.
+- [x] `mlx_cache_pin('lineitem')` / `mlx_cache_pin_tpch()` pre-warm.
 
 **2b — Scale & encoding**
 - [ ] Cascaded encoding + fused decode in cache pipeline.
@@ -446,7 +473,9 @@ speedup over GPU-tagged queries only; always report cold separately.
 **Quick snapshot:** `./benchmark/run_minimal.sh` — expression SUM, plain SUM, GROUP BY,
 filtered multi-agg at 10M/5M rows.
 
-**TPC-H:** `./benchmark/tpch/run.sh 1` — 22 queries, 5-run hot average, cold reported
+**TPC-H:** `python3 benchmark/tpch/run.py 1` — 22 queries, 5-run hot average.
+Roofline: `benchmark/bench_roofline.sh [sf]`. Q1 only: `benchmark/bench_q1.sh [sf]`.
+Full suite: `benchmark/run_all.sh [sf]`.
 separately. Runner marks unsupported queries; classify as GPU/HYBRID/CPU per §6.4.
 
 **Methodology (GQE-aligned):**
@@ -523,14 +552,15 @@ separately. Runner marks unsupported queries; classify as GPU/HYBRID/CPU per §6
 ```
 Phase 0  ████████████████████  100%
 Phase 1  ████████████████████  100%
-Phase 2  ██████░░░░░░░░░░░░░░   30%  ← GROUP BY v1, dense cache, zone prune done
+Phase 2  ████████░░░░░░░░░░░░   40%  ← Q1 fast path + roofline; grouped perf gap remains
 Phase 3  ░░░░░░░░░░░░░░░░░░░░    0%
 Phase 4  ░░░░░░░░░░░░░░░░░░░░    0%
 
-Tests:     166 assertions / 10 SQL files
+Tests:     211 assertions / 12 SQL files
 Operators: MLX_SUM[_CACHED], MLX_GROUPBY[_CACHED]
-Flagship:  VSS 16–17× batched; expression SUM 6–14× hot; GROUP BY <1 ms hot
-Next:      Q1 path (multi-agg + VARCHAR + WHERE), Q6 late mask, shape-aware decline
+Flagship:  VSS 16–17× batched; expression SUM 6–14× hot; roofline ~400 GiB/s SF10
+Q1:        fast path ON, ~15–20 ms SF1 (~1.2× CPU); target 3–5 ms with dedicated kernel
+Next:      Q1 dedicated kernel, shape-aware decline, gpudb slot-lock GROUP BY port
 ```
 
 **One-liner:** CPU owns bandwidth and joins; MLX owns fused analytics on resident fact

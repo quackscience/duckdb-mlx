@@ -25,6 +25,13 @@ int64_t MlxSumInt64(const int64_t *data, size_t count);
 //! bit-comparable (fp32 vs fp64).
 double MlxExprBenchInt64(const int64_t *data, size_t count);
 
+//! Benchmark resident int64 column streaming SUM (grid-stride + merge). Returns
+//! "sum=… rows=… ms=… gib_s=…" for roofline checks on pinned cache columns.
+std::string MlxStreamSumBench(const std::string &col_key);
+
+//! Benchmark resident int64 column multi-agg fusion (SUM+MIN+MAX+COUNT in one pass).
+std::string MlxMultiAggBench(const std::string &col_key);
+
 // GPU-resident vector similarity search (the "MlxTableFormat" cache concept,
 // specialized to embedding matrices). Pinned matrices are process-lifetime
 // and L2-normalized once at pin time, so search is one matvec + top-k.

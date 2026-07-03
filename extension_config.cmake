@@ -1,7 +1,7 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
 
 # Extension from this repo
-duckdb_extension_load(duckdb_mlx
+duckdb_extension_load(mlx
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
 )
 

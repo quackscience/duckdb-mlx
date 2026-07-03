@@ -34,5 +34,19 @@ void GroupedPackedTileAccumulate(MlxGroupedState &state, const mlx::core::array 
                                  const mlx::core::array &packed, int val_n,
                                  const std::vector<std::pair<size_t, int>> &val_slots,
                                  const std::vector<MlxSumProgram> &programs);
+void GroupedQ1FusedAccumulate(MlxGroupedState &state, const mlx::core::array &codes, const mlx::core::array &pass,
+                              const mlx::core::array &packed, int val_n,
+                              const std::vector<std::pair<size_t, int>> &val_slots,
+                              const std::vector<MlxSumProgram> &programs);
+
+struct MlxMultiAggResult {
+	int64_t sum = 0;
+	int64_t min = 0;
+	int64_t max = 0;
+	int64_t count = 0;
+};
+
+int64_t StreamingInt64Sum(const mlx::core::array &values);
+MlxMultiAggResult StreamingMultiAgg(const mlx::core::array &values);
 
 } // namespace duckdb_mlx

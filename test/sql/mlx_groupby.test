@@ -2,7 +2,7 @@
 # description: transparent GPU GROUP BY single integer key + SUM(column)
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 CREATE TABLE tg AS

@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class DuckdbMlxExtension : public Extension {
+class MlxExtension : public Extension {
 public:
 	void Load(ExtensionLoader &db) override;
 	std::string Name() override;

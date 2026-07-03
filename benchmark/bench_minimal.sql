@@ -1,7 +1,7 @@
 -- Minimal CPU vs GPU snapshot (moderate scale, ~1–2 min total).
 .timer on
 
-LOAD duckdb_mlx;
+LOAD mlx;
 SET mlx_min_rows = 1000;
 
 SELECT '--- 1. expression SUM (10M rows) ---' AS section;

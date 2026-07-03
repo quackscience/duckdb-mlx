@@ -2,7 +2,7 @@
 # description: Phase 0 spike 1 — MLX executes a computation on the GPU inside the extension
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 # On GPU builds mlx_selftest() must return exactly 'ok' (Metal available,
 # default device is the GPU, int64 and float32 reductions correct).

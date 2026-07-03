@@ -2,7 +2,7 @@
 # description: count/count(*)/avg/min/max and WHERE filters on the GPU, diffed vs CPU
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 CREATE TABLE ta AS

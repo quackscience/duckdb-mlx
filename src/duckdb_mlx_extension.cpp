@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "duckdb_mlx_extension.hpp"
+#include "mlx_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -28,7 +28,7 @@ static void MlxInfoFun(DataChunk &args, ExpressionState &state, Vector &result) 
 	std::string mlx_version = "none";
 #endif
 	auto info =
-	    StringUtil::Format("duckdb_mlx gpu=%s mlx=%s spdlog=%s", MLX_GPU_AVAILABLE ? "available" : "unavailable",
+	    StringUtil::Format("mlx gpu=%s mlx=%s spdlog=%s", MLX_GPU_AVAILABLE ? "available" : "unavailable",
 	                       mlx_version, duckdb_mlx::SpdlogVersion());
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	auto result_data = ConstantVector::GetData<string_t>(result);
@@ -38,6 +38,52 @@ static void MlxInfoFun(DataChunk &args, ExpressionState &state, Vector &result) 
 static void MlxSelftestFun(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef DUCKDB_MLX_GPU_ENABLED
 	auto status = duckdb_mlx::MlxSelftest();
+#else
+	std::string status = "gpu-disabled";
+#endif
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto result_data = ConstantVector::GetData<string_t>(result);
+	result_data[0] = StringVector::AddString(result, status);
+}
+
+static void MlxStreamSumBenchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto count = args.size();
+	UnifiedVectorFormat data;
+	args.data[0].ToUnifiedFormat(count, data);
+	auto strings = UnifiedVectorFormat::GetData<string_t>(data);
+	std::string status;
+	for (idx_t i = 0; i < count; i++) {
+		auto row_idx = data.sel->get_index(i);
+		if (!data.validity.RowIsValid(row_idx)) {
+			status = "error=null key";
+			break;
+		}
+		status = duckdb_mlx::MlxStreamSumBench(strings[row_idx].GetString());
+	}
+#else
+	std::string status = "gpu-disabled";
+#endif
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto result_data = ConstantVector::GetData<string_t>(result);
+	result_data[0] = StringVector::AddString(result, status);
+}
+
+static void MlxMultiAggBenchFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DUCKDB_MLX_GPU_ENABLED
+	auto count = args.size();
+	UnifiedVectorFormat data;
+	args.data[0].ToUnifiedFormat(count, data);
+	auto strings = UnifiedVectorFormat::GetData<string_t>(data);
+	std::string status;
+	for (idx_t i = 0; i < count; i++) {
+		auto row_idx = data.sel->get_index(i);
+		if (!data.validity.RowIsValid(row_idx)) {
+			status = "error=null key";
+			break;
+		}
+		status = duckdb_mlx::MlxMultiAggBench(strings[row_idx].GetString());
+	}
 #else
 	std::string status = "gpu-disabled";
 #endif
@@ -91,7 +137,7 @@ static void MlxSumFun(DataChunk &args, ExpressionState &state, Vector &result) {
 		}
 	}
 #else
-	throw NotImplementedException("mlx_sum requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_sum requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -125,7 +171,7 @@ static void MlxExprBenchFun(DataChunk &args, ExpressionState &state, Vector &res
 		result_data[i] = duckdb_mlx::MlxExprBenchInt64(child_data + entry.offset, entry.length);
 	}
 #else
-	throw NotImplementedException("mlx_expr_bench requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_expr_bench requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -145,7 +191,7 @@ static void MlxCacheStatsFun(DataChunk &args, ExpressionState &state, Vector &re
 	child_data[1] = stats.segments_pruned;
 	ListVector::SetListSize(result, 2);
 #else
-	throw NotImplementedException("mlx_cache_stats requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_cache_stats requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -157,7 +203,7 @@ static void MlxCacheClearFun(DataChunk &args, ExpressionState &state, Vector &re
 	auto result_data = ConstantVector::GetData<string_t>(result);
 	result_data[0] = StringVector::AddString(result, "ok");
 #else
-	throw NotImplementedException("mlx_cache_clear requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_cache_clear requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -178,7 +224,7 @@ static void MlxCachePinFun(DataChunk &args, ExpressionState &state, Vector &resu
 	child_data[2] = pin.already_resident ? 1 : 0;
 	ListVector::SetListSize(result, 3);
 #else
-	throw NotImplementedException("mlx_cache_pin requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_cache_pin requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -190,7 +236,7 @@ static void MlxCachePinTpchFun(DataChunk &args, ExpressionState &state, Vector &
 	auto result_data = ConstantVector::GetData<string_t>(result);
 	result_data[0] = StringVector::AddString(result, "ok");
 #else
-	throw NotImplementedException("mlx_cache_pin_tpch requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_cache_pin_tpch requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -240,7 +286,7 @@ static void MlxGroupbyBenchFun(DataChunk &args, ExpressionState &state, Vector &
 		result_data[i] = duckdb_mlx::MlxGroupbyBenchSum(key_data + ke.offset, vals.data(), ke.length, use_hash);
 	}
 #else
-	throw NotImplementedException("mlx_groupby_bench requires a GPU-enabled build of duckdb_mlx");
+	throw NotImplementedException("mlx_groupby_bench requires a GPU-enabled build of mlx");
 #endif
 }
 
@@ -260,11 +306,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("mlx_min_rows",
 	                          "Minimum estimated scan cardinality before a plan is considered for GPU execution",
 	                          LogicalType::UBIGINT, Value::UBIGINT(524288));
-	config.AddExtensionOption("mlx_log_level", "Log verbosity of duckdb_mlx (trace|debug|info|warn|error|critical|off)",
+	config.AddExtensionOption("mlx_log_level", "Log verbosity of mlx (trace|debug|info|warn|error|critical|off)",
 	                          LogicalType::VARCHAR, Value("warn"), SetLogLevel);
 
 	loader.RegisterFunction(ScalarFunction("mlx_info", {}, LogicalType::VARCHAR, MlxInfoFun));
 	loader.RegisterFunction(ScalarFunction("mlx_selftest", {}, LogicalType::VARCHAR, MlxSelftestFun));
+	loader.RegisterFunction(ScalarFunction("mlx_stream_sum_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                       MlxStreamSumBenchFun));
+	loader.RegisterFunction(ScalarFunction("mlx_multi_agg_bench", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                       MlxMultiAggBenchFun));
 	loader.RegisterFunction(
 	    ScalarFunction("mlx_sum", {LogicalType::LIST(LogicalType::BIGINT)}, LogicalType::BIGINT, MlxSumFun));
 	loader.RegisterFunction(ScalarFunction("mlx_expr_bench", {LogicalType::LIST(LogicalType::BIGINT)},
@@ -289,18 +339,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 #endif
 
 	duckdb_mlx::SetLogLevel("warn");
-	duckdb_mlx::LogDebug(StringUtil::Format("duckdb_mlx loaded (gpu=%s)", MLX_GPU_AVAILABLE ? "true" : "false"));
+	duckdb_mlx::LogDebug(StringUtil::Format("mlx loaded (gpu=%s)", MLX_GPU_AVAILABLE ? "true" : "false"));
 }
 
-void DuckdbMlxExtension::Load(ExtensionLoader &loader) {
+void MlxExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
-std::string DuckdbMlxExtension::Name() {
-	return "duckdb_mlx";
+std::string MlxExtension::Name() {
+	return "mlx";
 }
 
-std::string DuckdbMlxExtension::Version() const {
-#ifdef EXT_VERSION_DUCKDB_MLX
+std::string MlxExtension::Version() const {
+#ifdef EXT_VERSION_MLX
+	return EXT_VERSION_MLX;
+#elif defined(EXT_VERSION_DUCKDB_MLX)
 	return EXT_VERSION_DUCKDB_MLX;
 #else
 	return "";
@@ -311,7 +363,7 @@ std::string DuckdbMlxExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(duckdb_mlx, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(mlx, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

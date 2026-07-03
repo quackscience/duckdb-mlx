@@ -711,7 +711,7 @@ public:
 		return cached ? "MLX_SUM_CACHED" : "MLX_SUM";
 	}
 	string GetExtensionName() const override {
-		return "duckdb_mlx";
+		return "mlx";
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
@@ -1124,7 +1124,7 @@ public:
 		return cached ? "MLX_GROUPBY_CACHED" : "MLX_GROUPBY";
 	}
 	string GetExtensionName() const override {
-		return "duckdb_mlx";
+		return "mlx";
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {

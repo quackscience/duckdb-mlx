@@ -21,6 +21,8 @@ constexpr int kMaxTileSlots = 512;
 constexpr int kMaxTileCard = 64;
 constexpr int kTileRows = 131072;
 constexpr int kThreadsPerGroup = 256;
+//! Cap threadgroups for grid-stride reductions (gpudb metal_aggregator.mm pick_grid).
+constexpr int kMaxSumGrid = 4096;
 
 //! Shared Metal helpers: parallel tree reduce within a threadgroup.
 const char *TileKernelHeader() {
@@ -527,6 +529,392 @@ void GroupedPackedTileAccumulate(MlxGroupedState &state, const mx::array &codes,
 	    template_args, 0.0f, false, mx::Device::gpu);
 
 	RunTileAccumulateAndMerge(state, card, val_n, nprogs, n, tiles, built[0], built[1], built[2], val_slots, programs);
+}
+
+namespace {
+
+const char *TileBatchedReduceSource() {
+	return R"(
+            const int REDUCE_BATCH = 4;
+            threadgroup long tg_sum[REDUCE_BATCH * 256];
+            threadgroup int tg_cnt[REDUCE_BATCH * 256];
+            threadgroup int tg_rows[REDUCE_BATCH * 256];
+
+            threadgroup long block_sum[SLOTS];
+            threadgroup int block_cnt[SLOTS];
+            threadgroup int block_rows[CARD];
+
+            for (int base = 0; base < SLOTS; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, SLOTS - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int s = base + i;
+                    tg_sum[i * 256 + lid] = local_sum[s];
+                    tg_cnt[i * 256 + lid] = local_cnt[s];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_sum[i * 256 + lid] += tg_sum[i * 256 + lid + off];
+                            tg_cnt[i * 256 + lid] += tg_cnt[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int s = base + i;
+                        block_sum[s] = tg_sum[i * 256 + 0];
+                        block_cnt[s] = tg_cnt[i * 256 + 0];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (int base = 0; base < CARD; base += REDUCE_BATCH) {
+                int batch_n = min(REDUCE_BATCH, CARD - base);
+                for (int i = 0; i < batch_n; ++i) {
+                    int g = base + i;
+                    tg_rows[i * 256 + lid] = local_rows[g];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int off = 128; off > 0; off >>= 1) {
+                    for (int i = 0; i < batch_n; ++i) {
+                        if (lid < off) {
+                            tg_rows[i * 256 + lid] += tg_rows[i * 256 + lid + off];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (int i = 0; i < batch_n; ++i) {
+                    if (lid == 0) {
+                        int g = base + i;
+                        block_rows[g] = tg_rows[i * 256 + 0];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        )";
+}
+
+const mx::fast::CustomKernelFunction &StreamingInt64SumKernel() {
+	static auto kernel = []() {
+		// Grid-stride per-threadgroup reduction; mirrors gpudb sum.metal sum_i64.
+		const std::string src = R"(
+            int tid = int(thread_position_in_threadgroup.x);
+            uint gid = thread_position_in_grid.x;
+            uint gsize = 256u * threads_per_grid.x;
+            int nrows = int(values_shape[0]);
+            int block_id = int(threadgroup_position_in_grid.x);
+
+            long local = 0;
+            for (uint i = gid; i < uint(nrows); i += gsize) {
+                local += values[i];
+            }
+            threadgroup long tg_sum[256];
+            tg_sum[tid] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tg_tree_add_n(tg_sum, tid, 256);
+            if (tid == 0) {
+                partial_sums[block_id] = tg_sum[0];
+            }
+        )";
+		return mx::fast::metal_kernel("mlx_stream_sum_i64", {"values"}, {"partial_sums"}, src, TileKernelHeader(), true,
+		                              false);
+	}();
+	return kernel;
+}
+
+const mx::fast::CustomKernelFunction &StreamingInt64SumPartialsKernel() {
+	static auto kernel = []() {
+		const std::string src = R"(
+            int tid = int(thread_position_in_threadgroup.x);
+            int np = int(partials_shape[0]);
+
+            long local = 0;
+            for (int i = tid; i < np; i += 256) {
+                local += partials[i];
+            }
+            threadgroup long tg_sum[256];
+            tg_sum[tid] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tg_tree_add_n(tg_sum, tid, 256);
+            if (tid == 0) {
+                out_sum[0] = tg_sum[0];
+            }
+        )";
+		return mx::fast::metal_kernel("mlx_stream_sum_partials_i64", {"partials"}, {"out_sum"}, src, TileKernelHeader(),
+		                              true, false);
+	}();
+	return kernel;
+}
+
+const mx::fast::CustomKernelFunction &GroupedQ1FusedScanKernel() {
+	static auto kernel = []() {
+		std::string src;
+		src += R"(
+            int lid = int(thread_position_in_threadgroup.x);
+            uint gid = thread_position_in_grid.x;
+            uint gsize = 256u * threads_per_grid.x;
+            int block_id = int(threadgroup_position_in_grid.x);
+            int nrows = int(codes_shape[0]);
+            int pack_n = int(packed_shape[1]);
+
+            long local_sum[SLOTS];
+            int local_cnt[SLOTS];
+            int local_rows[CARD];
+            for (int i = 0; i < SLOTS; ++i) {
+                local_sum[i] = 0;
+                local_cnt[i] = 0;
+            }
+            for (int i = 0; i < CARD; ++i) {
+                local_rows[i] = 0;
+            }
+
+            for (uint row = gid; row < uint(nrows); row += gsize) {
+                if (pass[row] == 0) {
+                    continue;
+                }
+                int g = codes[row];
+                if (g < 0 || g >= CARD) {
+                    continue;
+                }
+                local_rows[g] += 1;
+                const int row_base = int(row) * pack_n;
+                for (int p = 0; p < VAL_N; ++p) {
+                    int pc = col_map[p];
+                    if (pc < 0 || pc >= pack_n) {
+                        continue;
+                    }
+                    int slot = g * VAL_N + p;
+                    local_sum[slot] += packed[row_base + pc];
+                    local_cnt[slot] += 1;
+                }
+            }
+
+        )";
+		src += TileBatchedReduceSource();
+		src += R"(
+            if (lid == 0) {
+                for (int s = 0; s < SLOTS; ++s) {
+                    partial_sums[block_id * SLOTS + s] = block_sum[s];
+                    partial_counts[block_id * SLOTS + s] = block_cnt[s];
+                }
+                for (int g = 0; g < CARD; ++g) {
+                    partial_rows[block_id * CARD + g] = block_rows[g];
+                }
+            }
+        )";
+		return mx::fast::metal_kernel("mlx_q1_fused_scan", {"codes", "pass", "packed", "col_map"},
+		                              {"partial_rows", "partial_sums", "partial_counts"}, src, TileKernelHeader(), true,
+		                              false);
+	}();
+	return kernel;
+}
+
+const mx::fast::CustomKernelFunction &StreamingMultiAggKernel() {
+	static auto kernel = []() {
+		// gpudb sum.metal agg_all_i64: one read, four accumulators per threadgroup.
+		const std::string src = R"(
+            int tid = int(thread_position_in_threadgroup.x);
+            uint gid = thread_position_in_grid.x;
+            uint gsize = 256u * threads_per_grid.x;
+            int block_id = int(threadgroup_position_in_grid.x);
+            int nrows = int(values_shape[0]);
+
+            long local_sum = 0;
+            long local_min = 0x7FFFFFFFFFFFFFFFL;
+            long local_max = (long)0x8000000000000000L;
+            long local_cnt = 0;
+
+            for (uint i = gid; i < uint(nrows); i += gsize) {
+                long x = values[i];
+                local_sum += x;
+                local_min = min(local_min, x);
+                local_max = max(local_max, x);
+                local_cnt += 1;
+            }
+
+            threadgroup long tg_sum[256];
+            threadgroup long tg_min[256];
+            threadgroup long tg_max[256];
+            threadgroup long tg_cnt[256];
+            tg_sum[tid] = local_sum;
+            tg_min[tid] = local_min;
+            tg_max[tid] = local_max;
+            tg_cnt[tid] = local_cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) {
+                    tg_sum[tid] += tg_sum[tid + off];
+                    tg_min[tid] = min(tg_min[tid], tg_min[tid + off]);
+                    tg_max[tid] = max(tg_max[tid], tg_max[tid + off]);
+                    tg_cnt[tid] += tg_cnt[tid + off];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                partials[block_id * 4 + 0] = tg_sum[0];
+                partials[block_id * 4 + 1] = tg_min[0];
+                partials[block_id * 4 + 2] = tg_max[0];
+                partials[block_id * 4 + 3] = tg_cnt[0];
+            }
+        )";
+		return mx::fast::metal_kernel("mlx_multi_agg_i64", {"values"}, {"partials"}, src, TileKernelHeader(), true,
+		                              false);
+	}();
+	return kernel;
+}
+
+const mx::fast::CustomKernelFunction &StreamingMultiAggPartialsKernel() {
+	static auto kernel = []() {
+		const std::string src = R"(
+            int tid = int(thread_position_in_threadgroup.x);
+            int np = int(partials_shape[0]) / 4;
+
+            long local_sum = 0;
+            long local_min = 0x7FFFFFFFFFFFFFFFL;
+            long local_max = (long)0x8000000000000000L;
+            long local_cnt = 0;
+
+            for (int i = tid; i < np; i += 256) {
+                local_sum += partials[i * 4 + 0];
+                local_min = min(local_min, partials[i * 4 + 1]);
+                local_max = max(local_max, partials[i * 4 + 2]);
+                local_cnt += partials[i * 4 + 3];
+            }
+
+            threadgroup long tg_sum[256];
+            threadgroup long tg_min[256];
+            threadgroup long tg_max[256];
+            threadgroup long tg_cnt[256];
+            tg_sum[tid] = local_sum;
+            tg_min[tid] = local_min;
+            tg_max[tid] = local_max;
+            tg_cnt[tid] = local_cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) {
+                    tg_sum[tid] += tg_sum[tid + off];
+                    tg_min[tid] = min(tg_min[tid], tg_min[tid + off]);
+                    tg_max[tid] = max(tg_max[tid], tg_max[tid + off]);
+                    tg_cnt[tid] += tg_cnt[tid + off];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                out_vals[0] = tg_sum[0];
+                out_vals[1] = tg_min[0];
+                out_vals[2] = tg_max[0];
+                out_vals[3] = tg_cnt[0];
+            }
+        )";
+		return mx::fast::metal_kernel("mlx_multi_agg_partials_i64", {"partials"}, {"out_vals"}, src, TileKernelHeader(),
+		                              true, false);
+	}();
+	return kernel;
+}
+
+} // namespace
+
+int PickSumGrid(int n) {
+	int grid = (n + kThreadsPerGroup - 1) / kThreadsPerGroup;
+	if (grid < 1) {
+		grid = 1;
+	}
+	if (grid > kMaxSumGrid) {
+		grid = kMaxSumGrid;
+	}
+	return grid;
+}
+
+int64_t StreamingInt64Sum(const mx::array &values) {
+	if (values.shape(0) == 0) {
+		return 0;
+	}
+	auto n = static_cast<int>(values.shape(0));
+	int grid = PickSumGrid(n);
+	int grid_threads = grid * kThreadsPerGroup;
+	auto pass1 = StreamingInt64SumKernel()({values}, {mx::Shape {grid}}, {mx::int64},
+	                                       std::make_tuple(grid_threads, 1, 1),
+	                                       std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
+	auto pass2 = StreamingInt64SumPartialsKernel()({pass1[0]}, {mx::Shape {1}}, {mx::int64},
+	                                               std::make_tuple(kThreadsPerGroup, 1, 1),
+	                                               std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false,
+	                                               mx::Device::gpu);
+	mx::eval(pass2[0]);
+	return pass2[0].item<int64_t>();
+}
+
+MlxMultiAggResult StreamingMultiAgg(const mx::array &values) {
+	MlxMultiAggResult out {};
+	if (values.shape(0) == 0) {
+		return out;
+	}
+	auto n = static_cast<int>(values.shape(0));
+	int grid = PickSumGrid(n);
+	int grid_threads = grid * kThreadsPerGroup;
+	auto pass1 = StreamingMultiAggKernel()({values}, {mx::Shape {grid, 4}}, {mx::int64},
+	                                       std::make_tuple(grid_threads, 1, 1),
+	                                       std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false, mx::Device::gpu);
+	auto pass2 = StreamingMultiAggPartialsKernel()({pass1[0]}, {mx::Shape {4}}, {mx::int64},
+	                                               std::make_tuple(kThreadsPerGroup, 1, 1),
+	                                               std::make_tuple(kThreadsPerGroup, 1, 1), {}, 0.0f, false,
+	                                               mx::Device::gpu);
+	mx::eval(pass2[0]);
+	auto data = pass2[0].data<int64_t>();
+	out.sum = data[0];
+	out.min = data[1];
+	out.max = data[2];
+	out.count = data[3];
+	return out;
+}
+
+void GroupedQ1FusedAccumulate(MlxGroupedState &state, const mx::array &codes, const mx::array &pass,
+                              const mx::array &packed, int val_n,
+                              const std::vector<std::pair<size_t, int>> &val_slots,
+                              const std::vector<MlxSumProgram> &programs) {
+	if (codes.shape(0) == 0 || !ProgramsUseTileKernel(programs, state.card)) {
+		throw std::runtime_error("GroupedQ1FusedAccumulate: ineligible program/card shape");
+	}
+	auto card = static_cast<int>(state.card);
+	auto n = static_cast<int>(codes.shape(0));
+	auto nprogs = programs.size();
+	const int slots = card * val_n;
+	if (val_n <= 0 || val_n > kMaxTileValProgs || slots > kMaxTileSlots) {
+		throw std::runtime_error("GroupedQ1FusedAccumulate: val program layout unsupported");
+	}
+
+	auto dump = mx::array(card, mx::int32);
+	auto zero_i32 = mx::array(0, mx::int32);
+	auto in_range = mx::logical_and(mx::greater_equal(codes, zero_i32), mx::less(codes, dump));
+	auto combined_pass = mx::logical_and(mx::astype(pass, mx::bool_), in_range);
+	auto pass_u8 = mx::astype(combined_pass, mx::uint8);
+
+	std::vector<int32_t> col_map(static_cast<size_t>(val_n), 0);
+	for (int i = 0; i < val_n; i++) {
+		col_map[static_cast<size_t>(i)] = val_slots[static_cast<size_t>(i)].second;
+	}
+	mx::array col_map_arr(col_map.data(), mx::Shape {val_n}, mx::int32);
+
+	const int parts = PickSumGrid(n);
+	int grid_threads = parts * kThreadsPerGroup;
+	auto template_args = TileTemplateArgs(card, val_n);
+
+	auto built = GroupedQ1FusedScanKernel()(
+	    {codes, pass_u8, packed, col_map_arr}, {mx::Shape {parts, card}, mx::Shape {parts, slots}, mx::Shape {parts, slots}},
+	    {mx::int32, mx::int64, mx::int32}, std::make_tuple(grid_threads, 1, 1), std::make_tuple(kThreadsPerGroup, 1, 1),
+	    template_args, 0.0f, false, mx::Device::gpu);
+
+	// Reduce partials with MLX sum (4096 x slots) — faster than custom merge kernel for Q1.
+	mx::eval({built[0], built[1], built[2]});
+	auto rows_reduced = mx::sum(built[0], 0);
+	auto sums_reduced = mx::sum(built[1], 0);
+	auto counts_reduced = mx::sum(built[2], 0);
+	mx::eval({rows_reduced, sums_reduced, counts_reduced});
+	MergeTilePartials(state, card, val_n, nprogs, val_slots, programs, rows_reduced, sums_reduced, counts_reduced);
 }
 
 } // namespace duckdb_mlx

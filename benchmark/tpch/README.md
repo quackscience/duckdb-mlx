@@ -1,5 +1,16 @@
 # TPC-H benchmark (GQE-aligned)
 
+## Quick repeatable suite
+
+```shell
+GEN=ninja make release
+benchmark/run_all.sh 1          # minimal + roofline + Q1 @ SF1
+benchmark/bench_roofline.sh 1   # stream SUM + multi-agg fusion (GiB/s)
+benchmark/bench_q1.sh 1         # TPC-H Q1 CPU vs GPU (pinned)
+benchmark/bench_q1.sh 10        # SF10 (pin ~2 min)
+python3 benchmark/tpch/run.py 10  # full 22-query GQE harness
+```
+
 ```shell
 python3 benchmark/tpch/run.py 10     # pins all 8 TPC-H tables, then 22 queries
 python3 benchmark/tpch/run.py 1      # SF1 (fast sanity check)
@@ -8,7 +19,7 @@ python3 benchmark/tpch/run.py 1      # SF1 (fast sanity check)
 Inside duckdb, GQE-style load:
 
 ```sql
-LOAD duckdb_mlx;
+LOAD mlx;
 SELECT mlx_cache_pin_tpch();          -- all 8 tables
 -- or: SELECT mlx_cache_pin('lineitem');
 -- returns [rows, columns, already_resident]

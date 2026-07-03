@@ -2,7 +2,7 @@
 # description: partition-level zone-map pruning on cached columns
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 SELECT mlx_cache_clear();

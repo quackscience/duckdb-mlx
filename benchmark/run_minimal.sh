@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build/release}"
 DUCKDB="${DUCKDB:-$BUILD/duckdb}"
 SQL="$ROOT/benchmark/bench_minimal.sql"
-OUT="${TMPDIR:-/tmp}/duckdb_mlx_bench_minimal_$$.txt"
+OUT="${TMPDIR:-/tmp}/mlx_bench_minimal_$$.txt"
 
 if [[ ! -x "$DUCKDB" ]]; then
   echo "Build first: GEN=ninja make release" >&2

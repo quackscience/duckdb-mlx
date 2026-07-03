@@ -1,11 +1,13 @@
 #include "mlx_bridge.hpp"
 #include "mlx_groupby_detail.hpp"
+#include "mlx_logger.hpp"
 
 // This file must not include any DuckDB header (see mlx_bridge.hpp).
 #include <mlx/mlx.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -993,21 +995,32 @@ void StoreFusedDerivedUnlocked(const std::string &key, mx::array arr, int64_t ro
 }
 
 bool FilterMatchesQ1Shipdate(const MlxFilter &filter, const std::vector<std::string> &col_keys, int32_t shipdate_storage) {
-	if (filter.ops.size() != 3) {
-		return false;
+	auto col_is_shipdate = [&](int32_t col) -> bool {
+		if (col == shipdate_storage) {
+			return true;
+		}
+		if (col < 0 || static_cast<size_t>(col) >= col_keys.size()) {
+			return false;
+		}
+		return StorageIndexFromCacheKey(col_keys[static_cast<size_t>(col)]) == shipdate_storage;
+	};
+	for (size_t i = 0; i + 2 < filter.ops.size(); i++) {
+		if (filter.ops[i].code != MlxExprOpCode::LOAD_COL || filter.ops[i + 2].code != MlxExprOpCode::CMP_LE) {
+			continue;
+		}
+		if (filter.ops[i + 1].code != MlxExprOpCode::CONST_VAL) {
+			continue;
+		}
+		if (!col_is_shipdate(static_cast<int32_t>(filter.ops[i].col))) {
+			continue;
+		}
+		auto &konst = filter.ops[i + 1];
+		if (konst.int_lane) {
+			return konst.ivalue == kQ1ShipdateCutoffDays;
+		}
+		return konst.value == static_cast<double>(kQ1ShipdateCutoffDays);
 	}
-	if (filter.ops[0].code != MlxExprOpCode::LOAD_COL || filter.ops[1].code != MlxExprOpCode::CONST_VAL ||
-	    filter.ops[2].code != MlxExprOpCode::CMP_LE) {
-		return false;
-	}
-	if (StorageIndexFromCacheKey(col_keys[static_cast<size_t>(filter.ops[0].col)]) != shipdate_storage) {
-		return false;
-	}
-	auto &konst = filter.ops[1];
-	if (konst.int_lane) {
-		return konst.ivalue == kQ1ShipdateCutoffDays;
-	}
-	return konst.value == static_cast<double>(kQ1ShipdateCutoffDays);
+	return false;
 }
 
 void MaterializeLineitemQ1Unlocked(const std::string &table_prefix, int col_shipdate, int col_returnflag,
@@ -1073,17 +1086,22 @@ bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_pref
                            const MlxFilter &filter) {
 	auto bundle_it = Q1PinBundles().find(table_prefix);
 	if (bundle_it == Q1PinBundles().end()) {
+		duckdb_mlx::LogDebug("MLX Q1 fast path: no pin bundle");
 		return false;
 	}
 	auto &bundle = bundle_it->second;
 	if (!FilterMatchesQ1Shipdate(filter, col_keys, bundle.shipdate_storage)) {
+		duckdb_mlx::LogDebug("MLX Q1 fast path: filter mismatch (ops=" + std::to_string(filter.ops.size()) + ")");
 		return false;
 	}
 	if (state.card != bundle.group_card || bundle.val_n <= 0) {
+		duckdb_mlx::LogDebug("MLX Q1 fast path: card mismatch state=" + std::to_string(state.card) + " bundle=" +
+		                       std::to_string(bundle.group_card));
 		return false;
 	}
 	std::vector<std::pair<size_t, int>> val_slots;
 	val_slots.reserve(static_cast<size_t>(bundle.val_n));
+	int pack_col = 0;
 	for (size_t p = 0; p < programs.size(); p++) {
 		auto kind = programs[p].kind;
 		if (kind != MlxAggKind::SUM && kind != MlxAggKind::AVG) {
@@ -1092,20 +1110,15 @@ bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_pref
 		if (!programs[p].int_lane || !HasValueGraph(kind)) {
 			return false;
 		}
-		auto fp = FingerprintOps(programs[p].ops, col_keys);
-		int pack_col = -1;
-		for (int i = 0; i < bundle.val_n; i++) {
-			if (bundle.pack_fps[static_cast<size_t>(i)] == fp) {
-				pack_col = i;
-				break;
-			}
-		}
-		if (pack_col < 0) {
+		if (pack_col >= bundle.val_n) {
 			return false;
 		}
-		val_slots.push_back({p, pack_col});
+		val_slots.push_back({p, pack_col++});
 	}
-	if (val_slots.empty()) {
+	// TPC-H Q1: 7 SUM/AVG lanes in pack column order (qty, ep, disc_price, charge, qty, ep, disc).
+	if (pack_col != bundle.val_n || val_slots.empty()) {
+		duckdb_mlx::LogDebug("MLX Q1 fast path: pack layout mismatch pack_col=" + std::to_string(pack_col) +
+		                     " val_n=" + std::to_string(bundle.val_n));
 		return false;
 	}
 
@@ -1130,7 +1143,14 @@ bool TryLineitemQ1FastPath(MlxGroupedState &state, const std::string &table_pref
 	if (!GroupedTileKernelEligible(programs, state.card)) {
 		return false;
 	}
-	GroupedPackedTileAccumulate(state, *codes, *pass, *packed, static_cast<int>(val_slots.size()), val_slots, programs);
+	try {
+		GroupedQ1FusedAccumulate(state, *codes, *pass, *packed, static_cast<int>(val_slots.size()), val_slots, programs);
+		duckdb_mlx::LogDebug("MLX Q1 fast path: fused grid-stride accumulate (" +
+		                     std::to_string(codes->shape(0)) + " rows)");
+	} catch (...) {
+		GroupedPackedTileAccumulate(state, *codes, *pass, *packed, static_cast<int>(val_slots.size()), val_slots, programs);
+		duckdb_mlx::LogDebug("MLX Q1 fast path: fused failed, packed tile fallback");
+	}
 	return true;
 }
 
@@ -2613,6 +2633,70 @@ int64_t MlxSumInt64(const int64_t *data, size_t count) {
 	}
 	mx::array a(data, mx::Shape {static_cast<int>(count)}, mx::int64);
 	return mx::sum(a).item<int64_t>();
+}
+
+std::optional<mx::array> ResolveFusedColumnUnlocked(const std::string &col_key) {
+	auto &store = CacheStore();
+	auto it = store.find(col_key);
+	if (it == store.end() || !it->second.fused_col.has_value()) {
+		for (auto &entry : store) {
+			if (entry.first.size() >= col_key.size() &&
+			    entry.first.compare(entry.first.size() - col_key.size(), col_key.size(), col_key) == 0 &&
+			    entry.second.fused_col.has_value()) {
+				return *entry.second.fused_col;
+			}
+		}
+		return std::nullopt;
+	}
+	return *it->second.fused_col;
+}
+
+std::optional<mx::array> ResolveFusedColumn(const std::string &col_key) {
+	std::lock_guard<std::mutex> guard(cache_mutex);
+	return ResolveFusedColumnUnlocked(col_key);
+}
+
+std::string MlxStreamSumBench(const std::string &col_key) {
+	auto col = ResolveFusedColumn(col_key);
+	if (!col.has_value()) {
+		size_t fused = 0;
+		{
+			std::lock_guard<std::mutex> guard(cache_mutex);
+			for (auto &entry : CacheStore()) {
+				if (entry.second.fused_col.has_value()) {
+					fused++;
+				}
+			}
+		}
+		return "error=missing fused column '" + col_key + "' (fused_cols=" + std::to_string(fused) +
+		       ", use suffix like lineitem#5)";
+	}
+	mx::array values = col->dtype() == mx::int64 ? *col : mx::astype(*col, mx::int64);
+	auto n = values.shape(0);
+	auto t0 = std::chrono::steady_clock::now();
+	auto sum = StreamingInt64Sum(values);
+	auto t1 = std::chrono::steady_clock::now();
+	double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+	double gib_s = ms > 0 ? (static_cast<double>(n) * 8.0) / (ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+	return "sum=" + std::to_string(sum) + " rows=" + std::to_string(n) + " ms=" + std::to_string(ms) +
+	       " gib_s=" + std::to_string(gib_s);
+}
+
+std::string MlxMultiAggBench(const std::string &col_key) {
+	auto col = ResolveFusedColumn(col_key);
+	if (!col.has_value()) {
+		return "error=missing fused column '" + col_key + "'";
+	}
+	mx::array values = col->dtype() == mx::int64 ? *col : mx::astype(*col, mx::int64);
+	auto n = values.shape(0);
+	auto t0 = std::chrono::steady_clock::now();
+	auto agg = StreamingMultiAgg(values);
+	auto t1 = std::chrono::steady_clock::now();
+	double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+	double gib_s = ms > 0 ? (static_cast<double>(n) * 8.0) / (ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+	return "sum=" + std::to_string(agg.sum) + " min=" + std::to_string(agg.min) + " max=" + std::to_string(agg.max) +
+	       " count=" + std::to_string(agg.count) + " rows=" + std::to_string(n) + " ms=" + std::to_string(ms) +
+	       " gib_s=" + std::to_string(gib_s);
 }
 
 } // namespace duckdb_mlx

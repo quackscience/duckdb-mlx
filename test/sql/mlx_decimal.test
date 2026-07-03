@@ -2,7 +2,7 @@
 # description: exact DECIMAL int64 lane + DATE filters (TPC-H Q6 shape)
 # group: [sql]
 
-require duckdb_mlx
+require mlx
 
 statement ok
 CREATE TABLE td AS
