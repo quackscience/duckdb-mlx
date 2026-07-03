@@ -40,7 +40,7 @@ const char *GroupbyPathFromEnv() {
 bool GroupbyShouldTrySlotlock(int n, int64_t estimated_groups) {
 	constexpr int64_t kMinGroups = 1024;
 	constexpr int64_t kSafeCap = 16'000'000;
-	constexpr int kMinRows = 500'000;
+	constexpr int kMinRows = 100'000;
 
 	const char *path = GroupbyPathFromEnv();
 	if (path) {

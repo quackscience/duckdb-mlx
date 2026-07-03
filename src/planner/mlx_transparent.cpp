@@ -1229,7 +1229,7 @@ static bool GroupbyInterceptDeclineCold(idx_t estimated_rows, int64_t combined_c
 	if (estimated_rows < kGroupBySmallN) {
 		return true;
 	}
-	if (!hash_groupby && combined_card > 0 && combined_card < kLowCardGroups && estimated_rows < kGroupByMidN) {
+	if (!hash_groupby && combined_card > 0 && combined_card < kLowCardGroups && estimated_rows <= kGroupByMidN) {
 		return true;
 	}
 	return false;

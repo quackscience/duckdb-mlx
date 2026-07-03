@@ -230,6 +230,13 @@ std::vector<MlxGroupbyRow> PickGpuPath(mx::array key_arr, mx::array val_arr, boo
 	if (path_env && std::strcmp(path_env, "radix") == 0) {
 		return GroupbySumRadixGpu(key_arr, val_arr);
 	}
+	if (path_env && std::strcmp(path_env, "slotlock") == 0) {
+		auto slotlock = GroupbySumSlotlockGpu(key_arr, val_arr);
+		if (GroupbySumSlotlockValid(key_arr, val_arr, slotlock)) {
+			return slotlock;
+		}
+		return GroupbySumSortScatter(key_arr, val_arr);
+	}
 	auto n = static_cast<int>(key_arr.shape(0));
 	if (GroupbyShouldTrySlotlock(n, estimated_groups)) {
 		auto slotlock = GroupbySumSlotlockGpu(key_arr, val_arr);
